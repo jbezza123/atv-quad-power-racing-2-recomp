@@ -57,11 +57,13 @@ run_records_panel_trace.bat
 
 The launcher selects the direct D3D11 backend, keeps normal depth and combiner behavior enabled, and sets `RECOMP_D3D_PANEL_TRACE=1`. Navigate to Track Select, leave the Records panels visible, then close the game normally. The log is written to `logs/records_panel_trace.log`. The trace is read-only and bounded (up to 4,096 matching entries); disabling the environment flag leaves the additional trace silent.
 
-## Current diagnostic finding and caveat
+## Records-panel format bug and fix (2026-10-31)
 
-In the 2026-10-31 run, the trace reached frame 984 and emitted 4,096 entries before reaching its cap. Three repeated small batches in the same screen region used texture `0x8251C000` (512×128, format `0x0F`, decoded-cache hash `4053DB42B2ADE0EE`) paired in a subsequent draw with `0x82505000` (64×64, format `0x0C`, hash `4AE8980CC853DEE3`). Both reported valid shader-resource views in those samples. These are **candidates**, not a confirmed identification of the white Records panels or proof that their contents/rendering are correct.
+The earlier broad trace produced candidate overlay textures `0x8251C000` (a numbered atlas) and `0x82505000` (a small mask), but neither alone explained the white cards. A focused A/B run identified six valid 256×128 Records render-target images (`0x82721000`, `0x82741000`, `0x82761000`, `0x82781000`, `0x827A1000`, and `0x827C1000`). Bypassing only the generated combiner made the card artwork visible while raw-texture and depth overrides remained disabled, isolating the issue to combiner handling rather than missing source pixels or depth state.
 
-The initial spatial filter accepted draws that merely overlapped the left-side area, so full-screen/background draws also consumed trace entries. A more selective follow-up capture may be needed to establish the exact panel-to-texture mapping and diagnose the white appearance. The original local run log is not included in this repository.
+The root cause was an alpha-only format misclassification in `xboxrecomp-main/src/nv2a/nv2a_backend_d3d11.c`: NV097 color-size `0x06` is full-color `A8R8G8B8`, not alpha-only. Alpha-only `A8` is `0x19`. The generated combiner intentionally forces sampled RGB to white for alpha-only textures, which erased the color of these full-color render targets. The D3D11 backend now checks `NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8` (`0x19`) and retains normal combiner rendering. The corrected Windows target compiled successfully, and the user confirmed the Records panels were visible during milestone validation.
+
+This is a targeted rendering fix, not a claim that the full game is complete. Other texture/rendering glitches and the reported in-race stability issue remain open. Run-specific logs, screenshots, and user game data are not included in this repository.
 
 ## Troubleshooting
 

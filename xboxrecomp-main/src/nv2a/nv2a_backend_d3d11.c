@@ -13,6 +13,7 @@
 #include "../d3d/d3d8_combiners.h"
 #include "../video/gpu_present.h"
 #include "nv2a_backend_d3d11.h"
+#include "nv2a_regs.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -1743,8 +1744,11 @@ static void d3d11_draw_impl(const Nv2aSurface *surface, const Nv2aBatch *batch)
             rc_cb.alpha_func = (func >= 0x200 && func <= 0x207) ? func - 0x1FF : 8;
             rc_cb.alpha_test_enable = batch->state && batch->state->alpha_test_enable;
             rc_cb.fog_enable = batch->state ? batch->state->fog_enable : 0;
+            /* NV097 0x06 is full-color A8R8G8B8; A8-only uses 0x19. */
             for (i = 0; i < NV2A_MAX_TEXTURES; i++)
-                rc_cb.alpha_only[i] = tex_stage[i] && (tex_stage[i]->color & 0xFF) == 0x06;
+                rc_cb.alpha_only[i] = tex_stage[i] &&
+                    (tex_stage[i]->color & 0xFF) ==
+                        NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8;
             if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_rcb, 0,
                                                   D3D11_MAP_WRITE_DISCARD, 0, &map))) {
                 memcpy(map.pData, &rc_cb, sizeof(rc_cb));
