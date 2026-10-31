@@ -65,6 +65,40 @@ The root cause was an alpha-only format misclassification in `xboxrecomp-main/sr
 
 This is a targeted rendering fix, not a claim that the full game is complete. Other texture/rendering glitches and the reported in-race stability issue remain open. Run-specific logs, screenshots, and user game data are not included in this repository.
 
+## Development status
+
+### Completed and verified in this snapshot
+
+- Established a Windows x64 CMake build for the generated ATV Quad Power Racing 2 recompilation project and bundled the required `xboxrecomp` source.
+- Added `install_build.ps1` and `run_records_panel_trace.bat` for repeatable setup/build and a bounded D3D11 diagnostic run.
+- Fixed the Track Select Records panels rendering white. The backend now treats NV097 format `0x06` as full-color A8R8G8B8 and reserves the alpha-only RGB override for A8 (`0x19`). The targeted build succeeded and the user verified the panels reappeared.
+- Recorded source provenance, prerequisites, game-file requirements, and third-party rights guidance in this README.
+
+### Current investigation (not yet promoted into this share snapshot)
+
+The working tree outside this packaged snapshot has additional F12-gated traces for race-scene actor batches, combiner stages, texture/state signatures, vertex fog and alpha. These are diagnostic-only. Recent isolated tests have not established a safe fix for missing distant rider models:
+
+- The corrected fog A/B matched 128 candidate draws; all had original vertex fog factor `1.0`, so forcing `1.0` had no effect.
+- The depth A/B disabled depth only for matching actor-like draws. It did not clearly restore horizon riders; it is not a confirmed fix.
+- The alpha-test A/B logged 128 matches, but the first automatic screenshot captured the Dunes loading screen rather than the race scene. Its visual effect on the missing racers is therefore inconclusive.
+- Grey ground patches have been traced to shadow-card draws arriving with blending disabled; the required blend behavior and horizontal shadow alignment remain unresolved.
+- A transient grid-pattern glitch during model/loading transitions is still under investigation.
+
+The in-progress renderer probes and run artifacts are intentionally not represented as verified fixes in this package. Do not enable diagnostic overrides in a normal build without a reproducible visual A/B and regression check.
+
+## Remaining development roadmap
+
+1. Add a race-scene-specific, one-shot capture trigger so screenshots align with candidate actor draws after the user reaches the race; identify rider, ATV, shadow, and LOD batches from synchronized images and trace records.
+2. Determine why distant AI rider meshes disappear while nearby models remain visible; test texture/combiner, alpha, depth, culling, LOD, and draw-distance hypotheses one variable at a time.
+3. Fix shadow-card blending and rider-to-shadow screen-space alignment without breaking other transparent effects.
+4. Reproduce and diagnose the transient grid pattern during model loading/transitions.
+5. Build and run the distributable snapshot after each candidate fix, compare against the known-good Records-panel screen, then update this README, the handoff, and the share bundle only for verified milestones.
+6. Continue broader game compatibility work: remaining game systems, input/audio/runtime edge cases, track/gameplay validation, and performance/stability remain outside the verified Records-panel fix.
+
+## Investigation handoff
+
+[`D3D11_HANDOFF.md`](D3D11_HANDOFF.md) carries the ongoing renderer investigation: confirmed Records-panel fix, diagnostic methods, A/B results, unresolved shadow/rider/grid issues, and recommended next steps. It is a working project handoff, not a claim of completion. Test logs, screenshots, local executable builds, and the user's game files remain excluded.
+
 ## Troubleshooting
 
 - **`cmake` is not found:** install CMake 3.20+ and ensure it is on `PATH`.
