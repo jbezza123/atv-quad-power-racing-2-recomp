@@ -1,0 +1,25 @@
+# Local builds and diagnostic logs
+/build/
+/logs/
+/CMakeCache.txt
+/CMakeFiles/
+/cmake_install.cmake
+/Makefile
+*.obj
+*.o
+*.lib
+*.pdb
+*.ilk
+*.exp
+*.exe
+
+# Recipient-supplied game content must stay out of this repository
+/game_project/game/*
+!/game_project/game/README_game_files.txt
+*.xbe
+*.iso
+*.xiso
+*.bad
+*.bah
+*.xmv
+*.wav

@@ -1,0 +1,1 @@
+Runtime game data is intentionally not included in this share bundle. Build compilation does not need it. To run the host executable, place your own legally obtained ATV Quad Power Racing 2 game files here, including default.xbe and the other files the game expects. The host code uses relative paths game/default.xbe and game/.
