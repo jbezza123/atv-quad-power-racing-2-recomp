@@ -890,6 +890,8 @@ int     xbox_DispatchGateOn(void);
 int     xbox_DispatchGateTryEnter(void);       /* the one-CPU gate: ISR delivery */
 void    xbox_DispatchGateEnter(void);
 void    xbox_DispatchGateLeave(void);
+int     xbox_DispatchGateYield(void);          /* release all recursive holds while blocked */
+void    xbox_DispatchGateResume(int depth);
 void    xbox_IrqlLeaveInterrupt(int saved);
 /* This thread is at DISPATCH_LEVEL or above, or holds the one-CPU gate. */
 int     xbox_IrqlThisThreadBlocksDpcs(void);
@@ -905,6 +907,7 @@ enum {
     XBOX_IRQ_VBLANK,
     XBOX_IRQ_APU,
     XBOX_IRQ_OHCI,
+    XBOX_IRQ_PGRAPH,
     XBOX_IRQ_LINES
 };
 /* What xbox_IrqPost tells the device model to do. */
@@ -932,6 +935,8 @@ unsigned long xbox_DispatchGateOwner(void);
  * or RECOMP_IRQ_SAFE_FORCE): one line naming the holder it runs beside (the
  * first 20 per line), and a count in the [IRQ] summary. */
 void    xbox_IrqNoteUngated(int line);
+/* Preserve the software-method-5 PGRAPH/PMC status bits until its DPC drains. */
+void    xbox_Nv2aSetSw5StatusHold(int hold);
 
 /* DPCs queued by an interrupt (the queue in kernel_bridge.c). On the console
  * one runs when the processor drops below DISPATCH, before the interrupted

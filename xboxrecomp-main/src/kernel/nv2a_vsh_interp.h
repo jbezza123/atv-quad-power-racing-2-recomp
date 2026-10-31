@@ -49,6 +49,14 @@ void nv2a_vsh_set_cxt_write(uint32_t enable);         /* _CXT_WRITE_EN      */
  * FINAL flag within program memory), which the caller treats as "cannot
  * transform this batch" rather than drawing garbage. */
 int  nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
+/* Bit n set when the loaded program reads v[n]. A batch fetches its attributes
+ * from guest memory once per vertex, and a lighting program reads four of the
+ * sixteen; this lets the caller skip the reads, and their bounds checks, for
+ * the ones the program never looks at. */
+uint32_t nv2a_vsh_input_mask(void);
+/* Instructions in the loaded program: for the profile, which needs to know
+ * whether a vertex costs 40 instructions or 200. */
+uint32_t nv2a_vsh_ops(void);
 
 /* Direct access, for the self-test. */
 void nv2a_vsh_set_constant(uint32_t index, const float v[4]);

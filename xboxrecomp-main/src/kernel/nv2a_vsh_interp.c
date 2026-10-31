@@ -33,6 +33,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "platform/host_time.h"   /* xbox_HostNowNs, for RECOMP_VSH_BENCH */
 
 static uint32_t s_program[NV2A_VSH_SLOTS][4];
 static float    s_const[NV2A_VSH_CONSTANTS][4];
@@ -48,10 +49,174 @@ static int vsh_dump_enabled(void)
     return s_const_trace;
 }
 
-static uint32_t field(const uint32_t *ins, int dw, int lo, int width)
+static __forceinline uint32_t field(const uint32_t *ins, int dw, int lo, int width)
 {
     return (ins[dw] >> lo) & ((1u << width) - 1u);
 }
+typedef struct { float v[4]; } vec4;
+
+/* ---- decoded program -----------------------------------------------------
+ *
+ * A title runs the same program for every vertex of every batch -- a heavy
+ * race frame here is 160,000 vertices through one uploaded program. The field
+ * extraction in read_src and the op/mask decode in the loop body then repeat
+ * millions of times per frame, and measured on that frame they were about 70%
+ * of the whole transform cost. Decoding once per upload moves all of it out of
+ * the per-vertex path: the executor below reads small integers.
+ *
+ * Invalidated by any program write or a new start slot, which is the only way
+ * the instruction stream can change. */
+typedef struct {
+    uint8_t mac, ilu;               /* opcodes; 0 = neither unit runs */
+    uint8_t mac_mask, ilu_mask;     /* temp write masks, x=8 y=4 z=2 w=1 */
+    uint8_t mdst, idst;             /* write target: 0..11 temp, 12 oPos, 0xFF none */
+    uint8_t omask, oaddr, out_to_c, out_from_ilu, final;
+    uint8_t need;                   /* sources this op reads: 1=A 2=B 4=C */
+    uint8_t ident[3];               /* source swizzle is x,y,z,w as written */
+    struct {
+        uint8_t neg, mux, reg, ci, rel;
+        uint8_t swz[4];             /* component order the swizzle selects */
+    } src[3];
+} VshOp;
+
+static VshOp   s_ops[NV2A_VSH_SLOTS];
+static int     s_ops_valid;
+static uint32_t s_ops_count;
+static uint32_t s_ops_inmask;       /* bit n = the program reads v[n] */
+
+static void decode_program(void)
+{
+    uint32_t s, n = 0;
+
+    s_ops_valid = 1;
+    s_ops_count = 0;
+    s_ops_inmask = 0;
+    for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
+        const uint32_t *ins = s_program[s];
+        VshOp *op = &s_ops[n];
+        uint32_t tdst, mac;
+        int i;
+
+        op->mac = (uint8_t)field(ins, 1, 21, 4);
+        op->ilu = (uint8_t)field(ins, 1, 25, 3);
+        op->mac_mask = (uint8_t)field(ins, 3, 24, 4);
+        op->ilu_mask = (uint8_t)field(ins, 3, 16, 4);
+        tdst = field(ins, 3, 20, 4);
+        op->omask = (uint8_t)field(ins, 3, 12, 4);
+        op->oaddr = (uint8_t)field(ins, 3, 3, 8);
+        op->out_to_c = (uint8_t)field(ins, 3, 11, 1);
+        op->out_from_ilu = (uint8_t)field(ins, 3, 2, 1);
+        op->final = (uint8_t)field(ins, 3, 0, 1);
+        mac = op->mac;
+        /* MAC writes its temp unless it is the ARL op (which only sets a0). */
+        op->mdst = (mac && mac != 13 && op->mac_mask &&
+                    (tdst < 12 || tdst == 12)) ? (uint8_t)tdst : 0xFF;
+        if (mac && mac != 13 && op->mac_mask && tdst > 12)
+            op->mdst = 0xFF;
+        /* Paired with any MAC op, the ILU writes R1 whatever the temp field
+         * says; alone, it uses the temp field. */
+        op->idst = (op->ilu && op->ilu_mask)
+                 ? (uint8_t)(mac ? 1u : tdst) : 0xFF;
+        if (op->idst != 0xFF && op->idst > 12)
+            op->idst = 0xFF;
+
+        /* How many of the instruction's three sources its opcodes actually
+         * read. A mov reads one; mad reads three; the ILU half reads C. On a
+         * program of mostly mov/mul/mad this removes a third of the source
+         * reads, and each read is a swizzle gather. */
+        op->need = 0;
+        switch (mac) {
+        case 0:  break;                       /* no MAC half */
+        case 1:  op->need |= 1; break;        /* mov  : A */
+        case 13: op->need |= 1; break;        /* arl  : A */
+        case 3:  op->need |= 1 | 4; break;    /* add  : A, C */
+        case 4:  op->need |= 1 | 2 | 4; break;/* mad  : A, B, C */
+        default: op->need |= 1 | 2; break;    /* the rest: A, B */
+        }
+        if (op->ilu)
+            op->need |= 4;                    /* every ILU op reads C */
+
+        for (i = 0; i < 3; i++) {
+            uint32_t neg, swz, mux, reg;
+            if (i == 0) {
+                neg = field(ins, 1, 8, 1); swz = field(ins, 1, 0, 8);
+                mux = field(ins, 2, 26, 2); reg = field(ins, 2, 28, 4);
+            } else if (i == 1) {
+                neg = field(ins, 2, 25, 1); swz = field(ins, 2, 17, 8);
+                mux = field(ins, 2, 11, 2); reg = field(ins, 2, 13, 4);
+            } else {
+                neg = field(ins, 2, 10, 1); swz = field(ins, 2, 2, 8);
+                mux = field(ins, 3, 28, 2);
+                reg = (field(ins, 2, 0, 2) << 2) | field(ins, 3, 30, 2);
+            }
+            op->src[i].neg = (uint8_t)neg;
+            op->src[i].mux = (uint8_t)mux;
+            op->src[i].reg = (uint8_t)reg;
+            op->src[i].rel = (uint8_t)field(ins, 3, 1, 1);
+            op->src[i].ci = (uint8_t)field(ins, 1, 13, 8);
+            op->src[i].swz[0] = (uint8_t)((swz >> 6) & 3);
+            op->src[i].swz[1] = (uint8_t)((swz >> 4) & 3);
+            op->src[i].swz[2] = (uint8_t)((swz >> 2) & 3);
+            op->src[i].swz[3] = (uint8_t)(swz & 3);
+            if (mux == 2)
+                s_ops_inmask |= 1u << field(ins, 1, 9, 4);
+            op->ident[i] = (uint8_t)(op->src[i].swz[0] == 0 &&
+                                     op->src[i].swz[1] == 1 &&
+                                     op->src[i].swz[2] == 2 &&
+                                     op->src[i].swz[3] == 3);
+        }
+        n++;
+        if (op->final)
+            break;
+    }
+    if (n && !s_ops[n - 1].final)
+        n = 0;                      /* no FINAL: no program to run */
+    s_ops_count = n;
+}
+
+static __forceinline vec4 read_src_dec(const VshOp *op, int which,
+                         const float in[NV2A_VSH_INPUTS][4],
+                         const vec4 *temp, const vec4 *opos, int a0)
+{
+    const float *s;
+    vec4 r;
+    const uint8_t *swz;
+
+    switch (op->src[which].mux) {
+    case 1:
+        s = (op->src[which].reg == 12) ? opos->v
+          : (op->src[which].reg < 12 ? temp[op->src[which].reg].v : temp[0].v);
+        break;
+    case 2:
+        s = in[op->src[which].reg & 15];
+        break;
+    default: {
+        int ci = op->src[which].ci;
+        if (op->src[which].rel)
+            ci += a0;
+        if (ci < 0 || ci >= NV2A_VSH_CONSTANTS)
+            ci = 0;
+        s = s_const[ci];
+        break;
+    }
+    }
+    swz = op->src[which].swz;
+    if (op->ident[which]) {
+        /* The overwhelmingly common swizzle: one 16-byte move, no gather. */
+        r.v[0] = s[0]; r.v[1] = s[1]; r.v[2] = s[2]; r.v[3] = s[3];
+    } else {
+        r.v[0] = s[swz[0]];
+        r.v[1] = s[swz[1]];
+        r.v[2] = s[swz[2]];
+        r.v[3] = s[swz[3]];
+    }
+    if (op->src[which].neg) {
+        r.v[0] = -r.v[0]; r.v[1] = -r.v[1];
+        r.v[2] = -r.v[2]; r.v[3] = -r.v[3];
+    }
+    return r;
+}
+
 
 /* ---- uploads ------------------------------------------------------------ */
 
@@ -65,13 +230,20 @@ void nv2a_vsh_program_word(uint32_t word)
 {
     if (s_load_slot < NV2A_VSH_SLOTS)
         s_program[s_load_slot][s_load_word] = word;
+    s_ops_valid = 0;
     if (++s_load_word == 4) {
         s_load_word = 0;
         s_load_slot++;
     }
 }
 
-void nv2a_vsh_set_start_slot(uint32_t slot) { s_start_slot = slot; }
+void nv2a_vsh_set_start_slot(uint32_t slot)
+{
+    if (slot != s_start_slot) {
+        s_start_slot = slot;
+        s_ops_valid = 0;
+    }
+}
 void nv2a_vsh_set_cxt_write(uint32_t enable) { s_cxt_write = enable; }
 
 void nv2a_vsh_set_constant_load(uint32_t index)
@@ -116,6 +288,7 @@ void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4])
 {
     if (slot < NV2A_VSH_SLOTS)
         memcpy(s_program[slot], words, sizeof s_program[slot]);
+    s_ops_valid = 0;
 }
 
 /* ---- disassembly (RECOMP_VSH_DUMP) --------------------------------------- */
@@ -196,52 +369,9 @@ void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word)
 
 /* ---- execution ----------------------------------------------------------- */
 
-typedef struct { float v[4]; } vec4;
 
-static vec4 read_src(const uint32_t *ins, int which,
-                     const float in[NV2A_VSH_INPUTS][4],
-                     const vec4 *temp, const vec4 *opos, int a0)
-{
-    uint32_t neg, swz, mux, reg;
-    const float *s;
-    vec4 r;
 
-    if (which == 0) {
-        neg = field(ins, 1, 8, 1); swz = field(ins, 1, 0, 8);
-        mux = field(ins, 2, 26, 2); reg = field(ins, 2, 28, 4);
-    } else if (which == 1) {
-        neg = field(ins, 2, 25, 1); swz = field(ins, 2, 17, 8);
-        mux = field(ins, 2, 11, 2); reg = field(ins, 2, 13, 4);
-    } else {
-        neg = field(ins, 2, 10, 1); swz = field(ins, 2, 2, 8);
-        mux = field(ins, 3, 28, 2);
-        reg = (field(ins, 2, 0, 2) << 2) | field(ins, 3, 30, 2);
-    }
-
-    if (mux == 1)
-        s = (reg == 12) ? opos->v : (reg < 12 ? temp[reg].v : temp[0].v);
-    else if (mux == 2)
-        s = in[field(ins, 1, 9, 4)];
-    else {
-        int ci = (int)field(ins, 1, 13, 8);
-        if (field(ins, 3, 1, 1))
-            ci += a0;
-        if (ci < 0 || ci >= NV2A_VSH_CONSTANTS)
-            ci = 0;
-        s = s_const[ci];
-    }
-    r.v[0] = s[(swz >> 6) & 3];
-    r.v[1] = s[(swz >> 4) & 3];
-    r.v[2] = s[(swz >> 2) & 3];
-    r.v[3] = s[swz & 3];
-    if (neg) {
-        r.v[0] = -r.v[0]; r.v[1] = -r.v[1];
-        r.v[2] = -r.v[2]; r.v[3] = -r.v[3];
-    }
-    return r;
-}
-
-static void write_masked(float *dst, const vec4 *src, uint32_t mask)
+static __forceinline void write_masked(float *dst, const vec4 *src, uint32_t mask)
 {
     if (mask & 8) dst[0] = src->v[0];
     if (mask & 4) dst[1] = src->v[1];
@@ -249,14 +379,14 @@ static void write_masked(float *dst, const vec4 *src, uint32_t mask)
     if (mask & 1) dst[3] = src->v[3];
 }
 
-static vec4 splat(float f)
+static __forceinline vec4 splat(float f)
 {
     vec4 r;
     r.v[0] = r.v[1] = r.v[2] = r.v[3] = f;
     return r;
 }
 
-static vec4 run_mac(uint32_t op, vec4 a, vec4 b, vec4 c, int *a0)
+static __forceinline vec4 run_mac(uint32_t op, vec4 a, vec4 b, vec4 c, int *a0)
 {
     vec4 r = a;
     int i;
@@ -283,7 +413,7 @@ static vec4 run_mac(uint32_t op, vec4 a, vec4 b, vec4 c, int *a0)
     return r;
 }
 
-static vec4 run_ilu(uint32_t op, vec4 c)
+static __forceinline vec4 run_ilu(uint32_t op, vec4 c)
 {
     float x = c.v[0];
     vec4 r = c;
@@ -329,9 +459,14 @@ static vec4 run_ilu(uint32_t op, vec4 c)
     return r;
 }
 
-int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+/* The executor proper: the decoded program, one vertex. */
+static int vsh_execute(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
 {
     static int dump = -1;
+    /* RECOMP_VSH_BENCH=empty runs the same prologue and epilogue with the
+     * instruction loop skipped, which separates a vertex's fixed cost from its
+     * per-instruction cost. */
+    static int skip_ops = -1;
     static uint32_t dumped[16];
     static int ndumped;
     vec4 temp[12], opos;
@@ -341,6 +476,8 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
 
     if (dump < 0)
         dump = getenv("RECOMP_VSH_DUMP") != NULL;
+    if (skip_ops < 0)
+        skip_ops = getenv("RECOMP_VSH_BENCH_EMPTY") != NULL;
     if (dump && ndumped < 16) {
         /* By content: titles reload different programs into the same slot. */
         uint32_t h = 2166136261u, t;
@@ -359,6 +496,11 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
         }
     }
 
+    if (!s_ops_valid)
+        decode_program();
+    if (!s_ops_count)
+        return 0;                    /* no FINAL: nothing to run */
+
     memset(temp, 0, sizeof temp);
     memset(&opos, 0, sizeof opos);
     memset(outregs, 0, sizeof outregs);
@@ -368,54 +510,58 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
      * unwritten stage at infinity. */
     outregs[9][3] = outregs[10][3] = outregs[11][3] = outregs[12][3] = 1.0f;
 
-    for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
-        const uint32_t *ins = s_program[s];
-        uint32_t mac = field(ins, 1, 21, 4), ilu = field(ins, 1, 25, 3);
-        uint32_t mac_mask = field(ins, 3, 24, 4), ilu_mask = field(ins, 3, 16, 4);
-        uint32_t tdst = field(ins, 3, 20, 4);
-        uint32_t omask = field(ins, 3, 12, 4), oaddr = field(ins, 3, 3, 8);
-        vec4 a = read_src(ins, 0, in, temp, &opos, a0);
-        vec4 b = read_src(ins, 1, in, temp, &opos, a0);
-        vec4 c = read_src(ins, 2, in, temp, &opos, a0);
+    for (s = 0; s < s_ops_count; s++) {
+        if (skip_ops)
+            break;
+        const VshOp *op = &s_ops[s];
+        vec4 a = {{0, 0, 0, 0}}, b = {{0, 0, 0, 0}}, c = {{0, 0, 0, 0}};
         vec4 mres = {{0, 0, 0, 0}}, ires = {{0, 0, 0, 0}};
+        uint32_t mac = op->mac, ilu = op->ilu;
+
+        if (op->need & 1)
+            a = read_src_dec(op, 0, in, temp, &opos, a0);
+        if (op->need & 2)
+            b = read_src_dec(op, 1, in, temp, &opos, a0);
+        if (op->need & 4)
+            c = read_src_dec(op, 2, in, temp, &opos, a0);
 
         if (mac)
             mres = run_mac(mac, a, b, c, &a0);
         if (ilu)
             ires = run_ilu(ilu, c);
 
-        if (mac && mac != 13 && mac_mask) {
-            float *d = tdst == 12 ? opos.v : (tdst < 12 ? temp[tdst].v : NULL);
-            if (d) write_masked(d, &mres, mac_mask);
+        if (op->mdst != 0xFF) {
+            float *d = op->mdst == 12 ? opos.v : temp[op->mdst].v;
+            write_masked(d, &mres, op->mac_mask);
         }
-        if (ilu && ilu_mask) {
+        if (op->idst != 0xFF) {
             /* Paired with any MAC op, the ILU can only write R1 -- even when
              * the MAC half writes no temp at all. The D3D epilogue is exactly
              * that: `mul o[0].xyz` beside `rcc R1.x`, then `mad` with R1.x.
              * Sending the rcc to the temp field (R7 there) left R1.x at 0 and
              * put every vertex of every 3D batch at c[59]. */
-            uint32_t it = mac ? 1u : tdst;
-            float *d = it == 12 ? opos.v : (it < 12 ? temp[it].v : NULL);
-            if (d) write_masked(d, &ires, ilu_mask);
+            float *d = op->idst == 12 ? opos.v : temp[op->idst].v;
+            write_masked(d, &ires, op->ilu_mask);
         }
-        if (omask) {
-            const vec4 *src = field(ins, 3, 2, 1) ? &ires : &mres;
-            if (!field(ins, 3, 11, 1)) {                  /* to c[] */
-                if (s_cxt_write && oaddr < NV2A_VSH_CONSTANTS)
-                    write_masked(s_const[oaddr], src, omask);
-            } else if (oaddr == 0) {
-                write_masked(opos.v, src, omask);
-            } else if (oaddr < 13) {
-                write_masked(outregs[oaddr], src, omask);
+        if (op->omask) {
+            const vec4 *src = op->out_from_ilu ? &ires : &mres;
+            if (!op->out_to_c) {                          /* to c[] */
+                if (s_cxt_write && op->oaddr < NV2A_VSH_CONSTANTS)
+                    write_masked(s_const[op->oaddr], src, op->omask);
+            } else if (op->oaddr == 0) {
+                write_masked(opos.v, src, op->omask);
+            } else if (op->oaddr < 13) {
+                write_masked(outregs[op->oaddr], src, op->omask);
             }
         }
-        if (field(ins, 3, 0, 1)) {
+        if (op->final) {
+            int k;
             memcpy(out->pos, opos.v, sizeof out->pos);
             /* The NV2A clamps the colour outputs to 0..1 before they are
              * interpolated, as the fixed-function path already does here.
              * Lighting programs push them well above 1 (SSX 3's riders), and
              * unclamped every lit model came out washed out. */
-            for (int k = 0; k < 4; k++) {
+            for (k = 0; k < 4; k++) {
                 float c0 = outregs[3][k], c1 = outregs[4][k];
                 out->d0[k] = c0 > 1.0f ? 1.0f : (c0 >= 0.0f ? c0 : 0.0f);
                 out->d1[k] = c1 > 1.0f ? 1.0f : (c1 >= 0.0f ? c1 : 0.0f);
@@ -429,4 +575,80 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
         }
     }
     return 0;
+}
+
+int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+{
+    /* RECOMP_VSH_BENCH=<n>: measure the loaded program, once, in the first
+     * batch that uses it. Optimising this interpreter against the race scene
+     * meant driving the game to the race for every change; a program is a
+     * program, so timing one during the first menu frame measures the same
+     * code.
+     *
+     * Short runs here swing by 50%: the emulator's audio, timer and raster
+     * threads share a two-core laptop with this one. So each size runs five
+     * times and the report keeps the fastest -- the run least disturbed by
+     * preemption -- and the program is also replayed at 2x and 4x length so
+     * the per-instruction slope can be read off separately from the per-vertex
+     * fixed cost. */
+    static int bench_left = -1;
+    if (bench_left > 0) {
+        uint32_t base, i, k, r;
+        Nv2aVshOutput tmp;
+        if (!s_ops_valid)
+            decode_program();
+        base = s_ops_count;
+        bench_left = 0;
+        for (k = 1; k <= 4; k *= 2) {
+            double best = 1e30, prev = 0.0;
+            for (i = 0; i < base * k && i < NV2A_VSH_SLOTS; i++) {
+                s_ops[i] = s_ops[i % base];
+                s_ops[i].final = 0;
+            }
+            s_ops[base * k - 1].final = 1;
+            s_ops_count = base * k;
+            for (r = 0; r < 5; r++) {
+                uint64_t t0, t1;
+                int j;
+                t0 = xbox_HostNowNs();
+                for (j = 0; j < 20000; j++)
+                    vsh_execute(in, &tmp);
+                t1 = xbox_HostNowNs();
+                if ((double)(t1 - t0) / 20000.0 < best)
+                    best = (double)(t1 - t0) / 20000.0;
+            }
+            fprintf(stderr,
+                "[VSH-BENCH] ops=%u ns_per_vertex=%.1f marginal_ns_per_op=%.2f\n",
+                s_ops_count, best,
+                k > 1 ? (best - prev) / (double)(base * k - base * (k / 2)) : 0.0);
+            fflush(stderr);
+            prev = best;
+        }
+        /* Put the real program back. */
+        s_ops_valid = 0;                 /* re-decode the real program */
+        decode_program();
+    }
+    if (bench_left == -1) {
+        const char *e = getenv("RECOMP_VSH_BENCH");
+        bench_left = e && *e ? atoi(e) : 0;
+    }
+    if (!s_ops_valid)
+        decode_program();
+    if (!s_ops_count)
+        return 0;                    /* no FINAL: nothing to run */
+    return vsh_execute(in, out);
+}
+
+uint32_t nv2a_vsh_input_mask(void)
+{
+    if (!s_ops_valid)
+        decode_program();
+    return s_ops_inmask;
+}
+
+uint32_t nv2a_vsh_ops(void)
+{
+    if (!s_ops_valid)
+        decode_program();
+    return s_ops_count;
 }

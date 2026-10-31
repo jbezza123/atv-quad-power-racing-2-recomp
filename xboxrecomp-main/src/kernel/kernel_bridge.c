@@ -371,6 +371,17 @@ static ULONG g_slot_ordinals[XBOX_KERNEL_THUNK_TABLE_SIZE];
 /* Calls per ordinal, for the ranking in the periodic summary. 378 counters
  * is smaller than one of the strings this file prints. */
 static unsigned long long g_ordinal_calls[XBOX_KERNEL_THUNK_TABLE_SIZE];
+/* Opt-in caller-site sampling for a title that keeps making kernel calls after
+ * its last present. Report only the most recent guest return address per
+ * ordinal in the existing periodic summary; never emit per-call output. */
+static uint32_t g_ordinal_last_caller[XBOX_KERNEL_THUNK_TABLE_SIZE];
+static int kernel_callsite_trace_on(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("RECOMP_KERNEL_CALLSITE_TRACE") != NULL;
+    return enabled;
+}
 /* 64-bit: a title that polls the clock through the kernel passes 2^31 calls
  * within minutes (X-Men Legends does). As a 32-bit int it wrapped negative,
  * "count <= log budget" turned true, and every kernel call then wrote two log
@@ -2002,6 +2013,102 @@ static HANDLE ke_guest_event_prepare(uint32_t guest_va, int *type)
     return h;
 }
 
+/* Bounded diagnostics for the race's hot KeWaitForSingleObject site. */
+static int kernel_wait_trace_on(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("RECOMP_KERNEL_WAIT_TRACE");
+        enabled = e && *e == '1';
+    }
+    return enabled;
+}
+
+static volatile LONG s_wait_trace_object;
+static volatile LONG s_wait_trace_entries;
+static volatile LONG s_wait_trace_sets;
+
+/* Test-only stand-in for the missing method-5 completion signal. The
+ * pushbuffer thread only queues; the timer thread signals the title-built
+ * event after the wait bridge has identified it. No guest ISR is called here. */
+static int kernel_sw5_event_test_on(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("RECOMP_NV2A_SW5_EVENT_TEST");
+        enabled = e && *e == '1';
+    }
+    return enabled;
+}
+
+static int kernel_sw5_isr_test_on(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("RECOMP_NV2A_SW5_ISR_TEST");
+        enabled = e && *e == '1';
+    }
+    return enabled;
+}
+
+static volatile LONG s_sw5_event_test_pending;
+static volatile LONG s_sw5_event_test_logs;
+static volatile LONG s_sw5_event_test_misses;
+static volatile LONG s_sw5_isr_pending;
+static volatile LONG s_sw5_isr_batch;
+static volatile LONG s_sw5_isr_active;
+static volatile LONG s_sw5_isr_ack_pending;
+static volatile LONG s_sw5_isr_logs;
+static volatile LONG s_sw5_isr_wait_logs;
+
+void xbox_Nv2aQueueSoftwareMethod5(void)
+{
+    if (kernel_sw5_event_test_on())
+        InterlockedIncrement(&s_sw5_event_test_pending);
+    if (kernel_sw5_isr_test_on())
+        InterlockedIncrement(&s_sw5_isr_pending);
+}
+
+static void kernel_sw5_event_test_pump(void)
+{
+    LONG pending;
+    uint32_t object;
+    int type;
+    HANDLE h;
+    uint32_t previous;
+    BOOL set_ok;
+
+    if (!kernel_sw5_event_test_on())
+        return;
+    pending = InterlockedExchange(&s_sw5_event_test_pending, 0);
+    if (pending <= 0)
+        return;
+    object = (uint32_t)InterlockedCompareExchange(&s_wait_trace_object, 0, 0);
+    if (!object) {
+        InterlockedAdd(&s_sw5_event_test_pending, pending);
+        return;
+    }
+    h = ke_guest_event(object, &type);
+    if (!h) {
+        InterlockedAdd(&s_sw5_event_test_pending, pending);
+        if (InterlockedIncrement(&s_sw5_event_test_misses) <= 4) {
+            fprintf(stderr, "  [SW5TEST] queued=%ld but wait object "
+                    "0x%08X is not a title event\n", pending, object);
+            fflush(stderr);
+        }
+        return;
+    }
+    previous = (uint32_t)InterlockedExchange(
+        (volatile LONG *)&BRIDGE_MEM32(object + 4), 1);
+    set_ok = SetEvent(h);
+    if (InterlockedIncrement(&s_sw5_event_test_logs) <= 16) {
+        fprintf(stderr, "  [SW5TEST] completion event=0x%08X queued=%ld "
+                "type=%d prev=%u host_ok=%d\n", object, pending, type,
+                previous, (int)set_ok);
+        fflush(stderr);
+    }
+}
+
 /* ── KeSetEvent (ordinal 145) ────────────────────────────── */
 static void bridge_KeSetEvent(void)
 {
@@ -2017,9 +2124,23 @@ static void bridge_KeSetEvent(void)
         int type;
         HANDLE ge = ke_guest_event(guest_va, &type);
         if (ge) {
-            g_eax = BRIDGE_MEM32(guest_va + 4) != 0;   /* previous state */
+            uint32_t previous = BRIDGE_MEM32(guest_va + 4);
+            BOOL set_ok;
+            g_eax = previous != 0;                    /* previous state */
             BRIDGE_MEM32(guest_va + 4) = 1;
-            SetEvent(ge);
+            set_ok = SetEvent(ge);
+            if (kernel_wait_trace_on() &&
+                guest_va == (uint32_t)InterlockedCompareExchange(
+                                &s_wait_trace_object, 0, 0)) {
+                LONG n = InterlockedIncrement(&s_wait_trace_sets);
+                if (n <= 32) {
+                    fprintf(stderr, "  [WAITTRACE] set n=%ld caller=0x%08X "
+                            "object=0x%08X type=%d prev=%u host_ok=%d\n",
+                            n, g_xbox_kernel_caller, guest_va, type,
+                            previous, (int)set_ok);
+                    fflush(stderr);
+                }
+            }
             return;
         }
     }
@@ -2043,6 +2164,18 @@ static void bridge_KeWaitForSingleObject(void)
     uint32_t alertable = STACK_ARG(3);
     uint32_t timeout_ptr = STACK_ARG(4);
     HANDLE h;
+    LONG trace_n = 0;
+    int trace = kernel_wait_trace_on();
+
+    if (g_xbox_kernel_caller == 0x00196E0Bu)
+        InterlockedExchange(&s_wait_trace_object, (LONG)object);
+    if (trace && g_xbox_kernel_caller == 0x00196E0Bu)
+        InterlockedExchange(&s_wait_trace_object, (LONG)object);
+    else if (!trace || object != (uint32_t)InterlockedCompareExchange(
+                                      &s_wait_trace_object, 0, 0))
+        trace = 0;
+    if (trace)
+        trace_n = InterlockedIncrement(&s_wait_trace_entries);
 
     {   /* An event the title built itself (see ke_guest_event). Its
          * SignalState in guest memory is the truth -- XDK code resets it by
@@ -2050,24 +2183,73 @@ static void bridge_KeWaitForSingleObject(void)
         int type;
         HANDLE ge = ke_guest_event_prepare(object, &type);
         if (ge) {
-            g_eax = (uint32_t)xbox_KeWaitForSingleObject(
-                ge, wait_reason, wait_mode,
-                (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+            if (trace && trace_n <= 32) {
+                fprintf(stderr, "  [WAITTRACE] enter n=%ld caller=0x%08X "
+                        "object=0x%08X path=title-event type=%d hdr=0x%08X "
+                        "state=%u host=%p reason=%u mode=%u alert=%u "
+                        "timeout_ptr=0x%08X\n", trace_n,
+                        g_xbox_kernel_caller, object, type,
+                        BRIDGE_MEM32(object), BRIDGE_MEM32(object + 4),
+                        (void *)ge, wait_reason, wait_mode, alertable,
+                        timeout_ptr);
+                fflush(stderr);
+            }
+            {
+                int gate_depth = 0;
+                uint32_t wait_status;
+                if (kernel_sw5_isr_test_on() &&
+                    g_xbox_kernel_caller == 0x00196E0Bu &&
+                    BRIDGE_MEM32(object + 4) == 0)
+                    gate_depth = xbox_DispatchGateYield();
+                wait_status = (uint32_t)xbox_KeWaitForSingleObject(
+                    ge, wait_reason, wait_mode,
+                    (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+                if (gate_depth)
+                    xbox_DispatchGateResume(gate_depth);
+                g_eax = wait_status;
+            }
             if (g_eax == 0 && type == 1)               /* synchronization: consumed */
                 BRIDGE_MEM32(object + 4) = 0;
+            if (trace && trace_n <= 32) {
+                fprintf(stderr, "  [WAITTRACE] exit n=%ld caller=0x%08X "
+                        "object=0x%08X status=0x%08X state=%u\n",
+                        trace_n, g_xbox_kernel_caller, object, g_eax,
+                        BRIDGE_MEM32(object + 4));
+                fflush(stderr);
+            }
             return;
         }
     }
 
     h = ke_shadow_lookup(object);
-    if (!h)
-        h = bridge_resolve_handle(object);
-    if (!h)
-        h = XBOX_TO_NATIVE(object);
-
+    {
+        const char *path = h ? "shadow" : "";
+        if (!h) {
+            h = bridge_resolve_handle(object);
+            if (h) path = "mapped";
+        }
+        if (!h) {
+            h = XBOX_TO_NATIVE(object);
+            path = h ? "native" : "null";
+        }
+        if (trace && trace_n <= 32) {
+            fprintf(stderr, "  [WAITTRACE] enter n=%ld caller=0x%08X "
+                    "object=0x%08X path=%s host=%p reason=%u mode=%u "
+                    "alert=%u timeout_ptr=0x%08X\n", trace_n,
+                    g_xbox_kernel_caller, object, path, (void *)h,
+                    wait_reason, wait_mode, alertable, timeout_ptr);
+            fflush(stderr);
+        }
+    }
     g_eax = (uint32_t)xbox_KeWaitForSingleObject(
         h, wait_reason, wait_mode,
         (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+    if (trace && trace_n <= 32) {
+        fprintf(stderr, "  [WAITTRACE] exit n=%ld caller=0x%08X "
+                "object=0x%08X status=0x%08X\n", trace_n,
+                g_xbox_kernel_caller, object, g_eax);
+        fflush(stderr);
+    }
 }
 
 /* ── NtWaitForSingleObject (ordinal 233) ─────────────────── */
@@ -2802,11 +2984,162 @@ static int kernel_call_isr(uint32_t vector)
 #define XBOX_NV2A_REG_BASE     0xFD000000u
 #define NV2A_PMC_INTR_0        0x00000100u
 #define NV2A_PMC_INTR_PCRTC    (1u << 24)
+#define NV2A_PMC_INTR_PGRAPH   (1u << 12)
 #define NV2A_PMC_INTR_EN_0     0x00000140u
 #define NV2A_PCRTC_INTR_0      0x00600100u
 #define NV2A_PCRTC_INTR_VBLANK (1u << 0)
 #define NV2A_PCRTC_INTR_EN_0   0x00600140u
 #define NV2A_VECTOR            3u
+
+#define SW5_PMC_ENABLE         0x00000200u
+#define SW5_PMC_ENABLE_PGRAPH  (1u << 12)
+#define SW5_PGRAPH_INTR        0x00040100u
+#define SW5_PGRAPH_INTR_NOTIFY (1u << 0)
+#define SW5_PGRAPH_INTR_EN     0x00040140u
+
+/* Method 5 is a software fence. The pushbuffer executor queues it, but the
+ * guest ISR must run at a kernel safe point with a valid stack/TIB. The timer
+ * thread has both; when the dispatch gate is occupied, the existing IRQ path
+ * posts this line to its holder instead of running guest code concurrently. */
+static void kernel_sw5_isr_deliver(void)
+{
+    LONG batch = InterlockedExchange(&s_sw5_isr_batch, 0);
+    uint32_t object = (uint32_t)InterlockedCompareExchange(
+        &s_wait_trace_object, 0, 0);
+    int claimed = kernel_call_isr(NV2A_VECTOR);
+    uint32_t state = object ? BRIDGE_MEM32(object + 4) : 0;
+
+    InterlockedExchange(&s_sw5_isr_ack_pending, 1);
+    InterlockedExchange(&s_sw5_isr_active, 0);
+    if (InterlockedIncrement(&s_sw5_isr_logs) <= 20) {
+        fprintf(stderr, "  [SW5ISR] vector=%u queued=%ld claimed=%d "
+                "event=0x%08X state=%u dpc_pending=%d "
+                "pgraph=0x%08X pmc=0x%08X\n",
+                NV2A_VECTOR, batch, claimed, object, state,
+                xbox_DpcPending(),
+                BRIDGE_MEM32(XBOX_NV2A_REG_BASE + SW5_PGRAPH_INTR),
+                BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0));
+        fflush(stderr);
+    }
+}
+
+static void kernel_sw5_isr_on_holder(void)
+{
+    kernel_sw5_isr_deliver();
+}
+
+static void kernel_sw5_isr_pump(void)
+{
+    uint32_t pmc_enable, pgraph_enable, pmc_irq_enable;
+    LONG pending;
+    int how;
+
+    if (!kernel_sw5_isr_test_on() || s_sw5_isr_active ||
+        InterlockedCompareExchange(&s_sw5_isr_pending, 0, 0) <= 0)
+        return;
+    if (!xbox_GetConnectedInterrupt(NV2A_VECTOR)) {
+        if (InterlockedIncrement(&s_sw5_isr_wait_logs) <= 4) {
+            fprintf(stderr, "  [SW5ISR] waiting for vector %u handler\n",
+                    NV2A_VECTOR);
+            fflush(stderr);
+        }
+        return;
+    }
+    pmc_irq_enable = BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_EN_0);
+    pmc_enable = BRIDGE_MEM32(XBOX_NV2A_REG_BASE + SW5_PMC_ENABLE);
+    pgraph_enable = BRIDGE_MEM32(XBOX_NV2A_REG_BASE + SW5_PGRAPH_INTR_EN);
+    /* ATV enables the PMC hardware line and PGRAPH block but leaves the
+     * per-source PGRAPH notify mask at zero. Method 5 is the driver's software
+     * fence trap, so use the registered vector-3 path rather than waiting for
+     * that unused hardware mask to be set. */
+    if (!(pmc_irq_enable & 1u) || !(pmc_enable & SW5_PMC_ENABLE_PGRAPH)) {
+        if (InterlockedIncrement(&s_sw5_isr_wait_logs) <= 4) {
+            fprintf(stderr, "  [SW5ISR] pending; gates PMC_HW=0x%08X "
+                    "PMC_ENABLE=0x%08X PGRAPH_NOTIFY_EN=0x%08X\n",
+                    pmc_irq_enable, pmc_enable, pgraph_enable);
+            fflush(stderr);
+        }
+        return;
+    }
+    if (InterlockedCompareExchange(&s_sw5_isr_active, 1, 0))
+        return;
+    pending = InterlockedExchange(&s_sw5_isr_pending, 0);
+    if (pending <= 0) {
+        InterlockedExchange(&s_sw5_isr_active, 0);
+        return;
+    }
+    InterlockedExchange(&s_sw5_isr_batch, pending);
+    xbox_Nv2aSetSw5StatusHold(1);
+    InterlockedOr((volatile LONG *)&BRIDGE_MEM32(
+                  XBOX_NV2A_REG_BASE + SW5_PGRAPH_INTR),
+                  (LONG)SW5_PGRAPH_INTR_NOTIFY);
+    InterlockedOr((volatile LONG *)&BRIDGE_MEM32(
+                  XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0),
+                  (LONG)NV2A_PMC_INTR_PGRAPH);
+    xbox_IrqSetHandler(XBOX_IRQ_PGRAPH, kernel_sw5_isr_on_holder);
+
+    how = xbox_IrqSafePointsOn() ? xbox_IrqPost(XBOX_IRQ_PGRAPH)
+                                 : XBOX_IRQ_UNGATED;
+    switch (how) {
+    case XBOX_IRQ_GATED:
+        kernel_sw5_isr_deliver();
+        xbox_DispatchGateLeave();
+        break;
+    case XBOX_IRQ_UNGATED: {
+        int gated = xbox_DispatchGateTryEnter();
+        if (!gated)
+            xbox_IrqNoteUngated(XBOX_IRQ_PGRAPH);
+        kernel_sw5_isr_deliver();
+        if (gated)
+            xbox_DispatchGateLeave();
+        break;
+    }
+    default:
+        break;                          /* the gate holder runs the ISR */
+    }
+}
+
+static void kernel_sw5_ack_after_dpcs(void)
+{
+    uint32_t object;
+    uint32_t previous;
+    int type = -1;
+    HANDLE h;
+    BOOL set_ok = FALSE;
+
+    if (!s_sw5_isr_ack_pending || s_sw5_isr_active || s_sw5_isr_pending ||
+        xbox_DpcPending())
+        return;
+    xbox_Nv2aSetSw5StatusHold(0);
+
+    /* Method 5 is a software fence. After the guest vector-3 ISR and any
+     * queued DPCs have drained, mirror completion to the dynamically observed
+     * CPU notification event so the waiting render thread can resume. */
+    object = (uint32_t)InterlockedCompareExchange(&s_wait_trace_object, 0, 0);
+    h = object ? ke_guest_event(object, &type) : NULL;
+    if (!h) {
+        if (InterlockedIncrement(&s_sw5_isr_logs) <= 24) {
+            fprintf(stderr, "  [SW5ISR] waiting for title fence event; "
+                    "object=0x%08X\n", object);
+            fflush(stderr);
+        }
+        return;
+    }
+
+    if (h) {
+        previous = (uint32_t)InterlockedExchange(
+            (volatile LONG *)&BRIDGE_MEM32(object + 4), 1);
+        set_ok = SetEvent(h);
+        if (set_ok)
+            InterlockedExchange(&s_sw5_isr_ack_pending, 0);
+        if (InterlockedIncrement(&s_sw5_isr_logs) <= 40) {
+            fprintf(stderr, "  [SW5ISR] fence-complete event=0x%08X type=%d "
+                    "prev=%u host_ok=%d\n", object, type, previous,
+                    (int)set_ok);
+            fflush(stderr);
+        }
+    }
+}
 
 /* Milliseconds on the performance counter, for the vblank schedule, the
  * kernel timers and the vblank ack wait. GetTickCount64 is not good enough
@@ -3710,7 +4043,10 @@ static void kernel_timer_loop_ns(void)
          * drains at a raise runs now rather than at the next edge. */
         xbox_HostTimerSleepNs(wait);
         kernel_vblank_tick_ns(xbox_HostNowNs(), &vbl_next);
+        kernel_sw5_event_test_pump();
+        kernel_sw5_isr_pump();
         busy = kernel_drain_dpcs(&ran);   /* deferred work, before due timers */
+        kernel_sw5_ack_after_dpcs();
         now_ms = kernel_timer_clock_ms();
         kernel_fire_timers(now_ms, &timer_due);
         if (g_dpc_head != g_dpc_tail)     /* a timer DPC queued on a busy gate */
@@ -3774,7 +4110,10 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 
             Sleep(10);
             kernel_vblank_tick();  /* the GPU's frame clock */
+            kernel_sw5_event_test_pump();
+            kernel_sw5_isr_pump();
             kernel_drain_dpcs(&ran);
+            kernel_sw5_ack_after_dpcs();
             kernel_fire_timers(kernel_timer_clock_ms(), &timer_due);
         }
     }
@@ -10833,6 +11172,8 @@ static void kernel_thunk_dispatch_body(void)
     g_kernel_call_count++;
     if (ordinal < XBOX_KERNEL_THUNK_TABLE_SIZE)
         g_ordinal_calls[ordinal]++;
+    if (kernel_callsite_trace_on() && ordinal < XBOX_KERNEL_THUNK_TABLE_SIZE && g_esp)
+        g_ordinal_last_caller[ordinal] = BRIDGE_MEM32(g_esp);
 
     if (KERNEL_LOG_ON()) {
         /* The guest return address sits at the top of the guest stack: the
@@ -10871,8 +11212,12 @@ static void kernel_thunk_dispatch_body(void)
                     if (best < 0)
                         break;
                     shown_ord[best] = 1;
-                    fprintf(stderr, "  [KERNEL]   ordinal %3d x%llu\n", best,
-                            (unsigned long long)g_ordinal_calls[best]);
+                    fprintf(stderr, "  [KERNEL]   ordinal %3d x%llu",
+                            best, (unsigned long long)g_ordinal_calls[best]);
+                    if (kernel_callsite_trace_on())
+                        fprintf(stderr, " last_ret=0x%08X",
+                                g_ordinal_last_caller[best]);
+                    fputc('\n', stderr);
                 }
             }
             fflush(stderr);

@@ -438,6 +438,13 @@ static volatile LONG g_nv2a_ack_stop = 0;
  * that is not listed still hangs -- run the title and the watchdog sample will
  * name the register.
  */
+static volatile LONG g_nv2a_sw5_status_hold;
+
+void xbox_Nv2aSetSw5StatusHold(int hold)
+{
+    InterlockedExchange(&g_nv2a_sw5_status_hold, hold ? 1 : 0);
+}
+
 static const struct { uint32_t offset; uint32_t busy_mask; } NV2A_ACK[] = {
     { 0x100410, 0x00010000u },  /* PFB flush kick, Halo 0x001EF930 */
 
@@ -1417,6 +1424,12 @@ static void nv2a_ack_busy_bits(int flip_held)
                 mask &= ~NV2A_ACK_PMC_INTR_PCRTC;
             else if (NV2A_ACK[i].offset == NV2A_ACK_PCRTC_INTR_0)
                 mask &= ~NV2A_ACK_PCRTC_INTR_VBLANK;
+        }
+        if (InterlockedCompareExchange(&g_nv2a_sw5_status_hold, 0, 0)) {
+            if (NV2A_ACK[i].offset == 0x000100u)
+                mask &= ~0x00001000u;  /* PMC_INTR_0: PGRAPH source */
+            else if (NV2A_ACK[i].offset == 0x400100u)
+                mask &= ~0x00000001u;  /* PGRAPH_INTR: software notify */
         }
         /* Interlocked: the vblank-ack thread and the guest change other
          * bits of the same word meanwhile. */

@@ -129,7 +129,26 @@ static uint32_t s_sampler_u, s_sampler_v, s_sampler_filter;
 /* The frontend alternates through more than eight atlases during a menu
  * frame. Keep enough decoded resources resident to avoid upload thrashing;
  * the LRU replacement still bounds memory use. */
-static D3DTextureCacheEntry s_tex_cache[64];
+/* A race frame asks for 250-odd distinct textures, so 64 slots thrashed: every
+ * frame re-decoded about 250 textures out of guest memory and re-uploaded them
+ * (35-40 ms of a heavy frame). The array is only pointers; the D3D resources
+ * behind it are what cost memory, and RECOMP_D3D_TEXTURE_CACHE caps how many of
+ * those stay resident. */
+#define D3D_TEXTURE_CACHE_MAX 512
+static D3DTextureCacheEntry s_tex_cache[D3D_TEXTURE_CACHE_MAX];
+static int s_tex_cache_slots;
+static int texture_cache_slots(void)
+{
+    if (!s_tex_cache_slots) {
+        const char *e = getenv("RECOMP_D3D_TEXTURE_CACHE");
+        long n = e && *e ? strtol(e, NULL, 10) : 256;
+        if (n < 8) n = 8;
+        if (n > D3D_TEXTURE_CACHE_MAX) n = D3D_TEXTURE_CACHE_MAX;
+        s_tex_cache_slots = (int)n;
+        fprintf(stderr, "[D3D11-BACKEND] texture cache slots=%d\n", s_tex_cache_slots);
+    }
+    return s_tex_cache_slots;
+}
 static D3DRenderTargetCacheEntry s_render_target_cache[D3D_RENDER_TARGET_CACHE_SIZE];
 static D3DDepthCacheEntry s_direct_depth_cache[D3D_DEPTH_CACHE_SIZE];
 static ID3D11RenderTargetView *s_backbuffer_rtv;
@@ -143,6 +162,7 @@ static uint32_t s_dynamic_texture_updates;
 static uint32_t s_surface_route_trace_count;
 static uint32_t s_sky_texture_route_mask;
 static uint32_t s_record_rt_dump_mask;
+static uint32_t s_panel_texture_dump_mask;
 static int s_sky_texture_trace = -1;
 static int s_perf_trace;
 static uint64_t s_perf_draw_ticks, s_perf_present_ticks;
@@ -171,6 +191,9 @@ static uint32_t s_batch_trace_samples;
 static int s_batch_trace = -1;
 static int s_panel_trace = -1;
 static uint32_t s_panel_trace_samples;
+static uint32_t s_records_trace_samples;
+static int s_panel_frame_dump_done;
+static int s_panel_frame_capture_requested;
 static int s_probe;
 static int s_present_once;
 static int s_continuous;
@@ -191,6 +214,28 @@ static int s_texture_hash_probe_logged;
 static uint32_t s_texture_hash_probe_calls;
 static uint64_t s_texture_hash_probe_ticks;
 static LARGE_INTEGER s_texture_hash_qpc_frequency;
+/* Unattended benchmarking and visual capture.
+ *
+ * RECOMP_D3D_FRAME_DUMP=<prefix> writes the presented backbuffer to
+ * <prefix>%05u.bmp every RECOMP_D3D_FRAME_DUMP_EVERY frames (default 60), and
+ * RECOMP_D3D_FPS_REPORT=<seconds> prints wall-clock frame pacing. The window's
+ * own FPS field and the pushbuffer's [GPU] fps are both measured against CPU
+ * time, which says nothing about how long a frame took on the wall; a run
+ * nobody is watching needs the wall number to be comparable across builds.
+ *
+ * The images matter as much: the framebuffer window follows guest memory,
+ * which the direct backend does not write, so its dumps are blank. Only the
+ * backbuffer shows what the renderer actually drew. */
+static const char *s_fb_dump_prefix;
+static uint32_t s_fb_dump_every;
+static uint32_t s_fb_dump_seq;
+static int s_fps_report;
+static LARGE_INTEGER s_fps_qpc_frequency;
+static LARGE_INTEGER s_fps_last_qpc;
+static uint32_t s_fps_frames, s_fps_draws;
+static double s_fps_elapsed_ms;
+static uint32_t s_fps_frame_ms[600];
+static uint32_t s_fps_frame_ms_len;
 
 static int batch_trace_enabled(void)
 {
@@ -218,7 +263,7 @@ static uint64_t panel_texture_hash(const Nv2aTexture *texture)
     uint32_t i;
     if (!texture)
         return 0;
-    for (i = 0; i < sizeof(s_tex_cache) / sizeof(s_tex_cache[0]); i++) {
+    for (i = 0; i < texture_cache_slots(); i++) {
         const D3DTextureCacheEntry *entry = &s_tex_cache[i];
         if (entry->texture && entry->offset == texture->offset &&
             entry->width == texture->width && entry->height == texture->height &&
@@ -410,7 +455,7 @@ static void release_all(void)
     if (s_sampler) ID3D11SamplerState_Release(s_sampler);
     {
         uint32_t i;
-        for (i = 0; i < sizeof(s_tex_cache) / sizeof(s_tex_cache[0]); i++) {
+        for (i = 0; i < texture_cache_slots(); i++) {
             if (s_tex_cache[i].srv) ID3D11ShaderResourceView_Release(s_tex_cache[i].srv);
             if (s_tex_cache[i].texture) ID3D11Texture2D_Release(s_tex_cache[i].texture);
             ZeroMemory(&s_tex_cache[i], sizeof(s_tex_cache[i]));
@@ -468,6 +513,9 @@ static void release_all(void)
     s_batch_trace = -1;
     s_panel_trace = -1;
     s_panel_trace_samples = 0;
+    s_records_trace_samples = 0;
+    s_panel_frame_dump_done = 0;
+    s_panel_frame_capture_requested = 0;
     s_probe = s_present_once = s_continuous = s_present_pending = s_frame_limited = 0;
     s_direct = 0;
     s_blend_key_valid = s_depth_key_valid = s_raster_key_valid = 0;
@@ -583,7 +631,10 @@ static int create_target(uint32_t width, uint32_t height)
     if (s_width == width && s_height == height && s_rtv)
         return 1;
 
-    if (s_ctx) ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+    if (s_ctx) {
+        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+        invalidate_binding_cache();
+    }
     if (!s_direct) {
         if (s_rtv) ID3D11RenderTargetView_Release(s_rtv);
         s_rtv = NULL;
@@ -823,6 +874,7 @@ static int select_direct_surface(const Nv2aSurface *surface)
                     return 0;
                 ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, null_srvs);
                 ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+                invalidate_binding_cache();
                 entry = &s_render_target_cache[slot];
                 if (entry->srv) ID3D11ShaderResourceView_Release(entry->srv);
                 if (entry->rtv) ID3D11RenderTargetView_Release(entry->rtv);
@@ -884,6 +936,7 @@ static int select_direct_surface(const Nv2aSurface *surface)
         if (s_ctx) {
             ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, null_srvs);
             ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+            invalidate_binding_cache();
         }
         s_active_surface_va = surface->color_va;
     }
@@ -909,6 +962,140 @@ static uint64_t decoded_texture_sample_hash(const uint32_t *pixels,
         }
     }
     return hash;
+}
+
+static int panel_texture_dump_index(uint32_t offset)
+{
+    switch (offset) {
+    case 0x8251C000: return 0;
+    case 0x82505000: return 1;
+    case 0x824B8000: return 2;
+    case 0x824D1000: return 3;
+    default: return -1;
+    }
+}
+
+static void dump_panel_texture_once(const Nv2aTexture *texture,
+                                    const uint32_t *pixels)
+{
+    const char *prefix = getenv("RECOMP_D3D_PANEL_TEXTURE_DUMP_PREFIX");
+    FILE *file, *alpha_file;
+    char path[512], alpha_path[512];
+    uint8_t header[54], padding_bytes[3] = {0, 0, 0};
+    uint32_t index, bit, row_bytes, pad, image_bytes, file_bytes;
+    uint32_t x, y, alpha_zero = 0, alpha_partial = 0, alpha_opaque = 0;
+    uint32_t near_white = 0, near_black = 0;
+    uint32_t r_min = 255, r_max = 0, g_min = 255, g_max = 0;
+    uint32_t b_min = 255, b_max = 0, a_min = 255, a_max = 0;
+    uint64_t r_sum = 0, g_sum = 0, b_sum = 0, a_sum = 0, count;
+    uint64_t hash;
+    int write_failed = 0;
+
+    if (!panel_trace_enabled() || !texture || !pixels || !prefix || !*prefix)
+        return;
+    index = (uint32_t)panel_texture_dump_index(texture->offset);
+    if (index > 3 || !texture->width || !texture->height ||
+        texture->width > 2048 || texture->height > 2048)
+        return;
+    bit = 1u << index;
+    if (s_panel_texture_dump_mask & bit)
+        return;
+
+    row_bytes = texture->width * 3u;
+    pad = (4u - (row_bytes & 3u)) & 3u;
+    image_bytes = (row_bytes + pad) * texture->height;
+    file_bytes = 54u + image_bytes;
+    snprintf(path, sizeof(path), "%stex_%08X.bmp", prefix, texture->offset);
+    snprintf(alpha_path, sizeof(alpha_path), "%stex_%08X_alpha.bmp",
+             prefix, texture->offset);
+    file = fopen(path, "wb");
+    if (!file) {
+        fprintf(stderr, "[D3D11-PANEL-TEX] open failed guest=0x%08X path=%s\n",
+                texture->offset, path);
+        return;
+    }
+    alpha_file = fopen(alpha_path, "wb");
+    if (!alpha_file) {
+        fclose(file);
+        remove(path);
+        fprintf(stderr,
+                "[D3D11-PANEL-TEX] alpha open failed guest=0x%08X path=%s\n",
+                texture->offset, alpha_path);
+        return;
+    }
+
+    ZeroMemory(header, sizeof(header));
+    header[0] = 'B'; header[1] = 'M';
+    memcpy(header + 2, &file_bytes, 4);
+    header[10] = 54; header[14] = 40;
+    memcpy(header + 18, &texture->width, 4);
+    memcpy(header + 22, &texture->height, 4);
+    header[26] = 1; header[28] = 24;
+    memcpy(header + 34, &image_bytes, 4);
+    if (fwrite(header, 1, sizeof(header), file) != sizeof(header))
+        write_failed = 1;
+    if (fwrite(header, 1, sizeof(header), alpha_file) != sizeof(header))
+        write_failed = 1;
+
+    for (y = 0; y < texture->height; ++y) {
+        uint32_t source_y = texture->height - 1u - y;
+        for (x = 0; x < texture->width; ++x) {
+            uint32_t pixel = pixels[(size_t)source_y * texture->width + x];
+            uint32_t b = pixel & 0xFFu;
+            uint32_t g = (pixel >> 8) & 0xFFu;
+            uint32_t r = (pixel >> 16) & 0xFFu;
+            uint32_t a = (pixel >> 24) & 0xFFu;
+            uint8_t bgr[3] = {(uint8_t)b, (uint8_t)g, (uint8_t)r};
+            uint8_t alpha_bgr[3] = {(uint8_t)a, (uint8_t)a, (uint8_t)a};
+            if (fwrite(bgr, 1, sizeof(bgr), file) != sizeof(bgr))
+                write_failed = 1;
+            if (fwrite(alpha_bgr, 1, sizeof(alpha_bgr), alpha_file) !=
+                sizeof(alpha_bgr))
+                write_failed = 1;
+            if (a == 0) alpha_zero++;
+            else if (a == 255) alpha_opaque++;
+            else alpha_partial++;
+            if (r >= 248 && g >= 248 && b >= 248) near_white++;
+            if (r <= 7 && g <= 7 && b <= 7) near_black++;
+            if (r < r_min) r_min = r;
+            if (r > r_max) r_max = r;
+            if (g < g_min) g_min = g;
+            if (g > g_max) g_max = g;
+            if (b < b_min) b_min = b;
+            if (b > b_max) b_max = b;
+            if (a < a_min) a_min = a;
+            if (a > a_max) a_max = a;
+            r_sum += r; g_sum += g; b_sum += b; a_sum += a;
+        }
+        if (pad && fwrite(padding_bytes, 1, pad, file) != pad)
+            write_failed = 1;
+        if (pad && fwrite(padding_bytes, 1, pad, alpha_file) != pad)
+            write_failed = 1;
+    }
+    if (fclose(file) != 0)
+        write_failed = 1;
+    if (fclose(alpha_file) != 0)
+        write_failed = 1;
+    if (write_failed) {
+        remove(path);
+        remove(alpha_path);
+        fprintf(stderr, "[D3D11-PANEL-TEX] write failed guest=0x%08X path=%s\n",
+                texture->offset, path);
+        return;
+    }
+
+    count = (uint64_t)texture->width * texture->height;
+    hash = decoded_texture_sample_hash(pixels, texture->width, texture->height);
+    s_panel_texture_dump_mask |= bit;
+    fprintf(stderr,
+        "[D3D11-PANEL-TEX] guest=0x%08X size=%ux%u fmt=0x%02X hash=%016llX alpha=%u/%u/%u range=%u..%u white=%u black=%u rgb=%u..%u/%u..%u/%u..%u avg=%llu/%llu/%llu file=%s alpha_file=%s\n",
+        texture->offset, texture->width, texture->height, texture->color & 0xFF,
+        (unsigned long long)hash, alpha_zero, alpha_partial, alpha_opaque,
+        a_min, a_max, near_white, near_black,
+        r_min, r_max, g_min, g_max, b_min, b_max,
+        (unsigned long long)(r_sum / count),
+        (unsigned long long)(g_sum / count),
+        (unsigned long long)(b_sum / count), path, alpha_path);
 }
 
 static int record_rt_index(uint32_t color_va)
@@ -1029,6 +1216,206 @@ static void dump_record_rt_once(uint32_t slot,
         nonzero_pixels, nonzero_bytes, or_byte, path);
 }
 
+/* Copy the current backbuffer to a 24-bit BMP. No once-only guard here: the
+ * scheduled dump below needs it repeatedly, and the F12 capture wraps it. */
+static int dump_backbuffer_bmp(const char *path)
+{
+    D3D11_TEXTURE2D_DESC source_desc, staging_desc;
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    ID3D11Resource *resource = NULL;
+    ID3D11Texture2D *source, *staging = NULL;
+    HRESULT hr;
+    FILE *file = NULL;
+    char reason[96] = "capture failed";
+    uint8_t header[54], padding_bytes[3] = {0, 0, 0};
+    uint32_t row_bytes, pad, image_bytes, file_bytes, x, y;
+    int mapped_ok = 0, write_failed = 0;
+
+    if (!path || !*path)
+        return 0;
+    if (!s_dev || !s_ctx || !s_backbuffer_rtv) {
+        fprintf(stderr, "[D3D11-PANEL-FRAME] no D3D11 backbuffer is available\n");
+        return 0;
+    }
+
+    ID3D11RenderTargetView_GetResource(s_backbuffer_rtv, &resource);
+    if (!resource) {
+        fprintf(stderr, "[D3D11-PANEL-FRAME] backbuffer resource lookup failed\n");
+        return 0;
+    }
+    source = (ID3D11Texture2D *)resource;
+    ID3D11Texture2D_GetDesc(source, &source_desc);
+    if (!source_desc.Width || !source_desc.Height ||
+        source_desc.Width > 4096 || source_desc.Height > 4096 ||
+        source_desc.SampleDesc.Count != 1 ||
+        (source_desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM &&
+         source_desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM)) {
+        fprintf(stderr,
+            "[D3D11-PANEL-FRAME] unsupported backbuffer %ux%u fmt=%u samples=%u\n",
+            source_desc.Width, source_desc.Height, source_desc.Format,
+            source_desc.SampleDesc.Count);
+        ID3D11Resource_Release(resource);
+        return 0;
+    }
+
+    staging_desc = source_desc;
+    staging_desc.Usage = D3D11_USAGE_STAGING;
+    staging_desc.BindFlags = 0;
+    staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    staging_desc.MiscFlags = 0;
+    hr = ID3D11Device_CreateTexture2D(s_dev, &staging_desc, NULL, &staging);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[D3D11-PANEL-FRAME] staging texture create failed hr=0x%08X\n",
+                (unsigned)hr);
+        ID3D11Resource_Release(resource);
+        return 0;
+    }
+
+    /* Release the backbuffer's output binding before copying it to staging. */
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+    s_bound_rtv = NULL;
+    s_bound_dsv = NULL;
+    s_binding_cache_valid = 0;
+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)staging, resource);
+    hr = ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)staging, 0,
+                                 D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[D3D11-PANEL-FRAME] staging map failed hr=0x%08X\n",
+                (unsigned)hr);
+        ID3D11Texture2D_Release(staging);
+        ID3D11Resource_Release(resource);
+        return 0;
+    }
+    mapped_ok = 1;
+
+    row_bytes = source_desc.Width * 3u;
+    pad = (4u - (row_bytes & 3u)) & 3u;
+    image_bytes = (row_bytes + pad) * source_desc.Height;
+    file_bytes = 54u + image_bytes;
+    file = fopen(path, "wb");
+    if (!file) {
+        snprintf(reason, sizeof(reason), "open failed");
+        write_failed = 1;
+    } else {
+        ZeroMemory(header, sizeof(header));
+        header[0] = 'B'; header[1] = 'M';
+        memcpy(header + 2, &file_bytes, 4);
+        header[10] = 54; header[14] = 40;
+        memcpy(header + 18, &source_desc.Width, 4);
+        memcpy(header + 22, &source_desc.Height, 4);
+        header[26] = 1; header[28] = 24;
+        memcpy(header + 34, &image_bytes, 4);
+        if (fwrite(header, 1, sizeof(header), file) != sizeof(header))
+            write_failed = 1;
+        for (y = 0; y < source_desc.Height; ++y) {
+            const uint8_t *row = (const uint8_t *)mapped.pData +
+                (size_t)(source_desc.Height - 1u - y) * mapped.RowPitch;
+            for (x = 0; x < source_desc.Width; ++x) {
+                const uint8_t *pixel = row + (size_t)x * 4u;
+                uint8_t bgr[3];
+                if (source_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM) {
+                    bgr[0] = pixel[2]; bgr[1] = pixel[1]; bgr[2] = pixel[0];
+                } else {
+                    bgr[0] = pixel[0]; bgr[1] = pixel[1]; bgr[2] = pixel[2];
+                }
+                if (fwrite(bgr, 1, sizeof(bgr), file) != sizeof(bgr))
+                    write_failed = 1;
+            }
+            if (pad && fwrite(padding_bytes, 1, pad, file) != pad)
+                write_failed = 1;
+        }
+        if (fclose(file) != 0)
+            write_failed = 1;
+        file = NULL;
+    }
+
+    if (mapped_ok)
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)staging, 0);
+    ID3D11Texture2D_Release(staging);
+    ID3D11Resource_Release(resource);
+    if (write_failed) {
+        remove(path);
+        fprintf(stderr, "[D3D11-PANEL-FRAME] %s path=%s\n", reason, path);
+        return 0;
+    }
+    fprintf(stderr,
+        "[D3D11-PANEL-FRAME] saved %ux%u fmt=%u path=%s via F12\n",
+        source_desc.Width, source_desc.Height, source_desc.Format, path);
+    return 1;
+}
+
+static void dump_panel_frame_once(const char *path)
+{
+    if (!path || !*path || s_panel_frame_dump_done)
+        return;
+    s_panel_frame_dump_done = 1;
+    dump_backbuffer_bmp(path);
+}
+
+/* Screenshot every s_fb_dump_every presented frames, for a run nobody is
+ * watching. Called just before the flip, so the image is the finished frame
+ * rather than the previous one. */
+static void frame_dump_tick(void)
+{
+    char path[512];
+    if (!s_fb_dump_prefix || !*s_fb_dump_prefix || !s_fb_dump_every)
+        return;
+    if (s_frame_count % s_fb_dump_every)
+        return;
+    snprintf(path, sizeof path, "%s%05u.bmp", s_fb_dump_prefix, s_fb_dump_seq++);
+    dump_backbuffer_bmp(path);
+}
+
+/* Wall-clock frame pacing, printed every s_fps_report seconds. The percentiles
+ * are the point: an average over a run that mixes menus with a race describes
+ * neither scene, and a p95 frame time is what a player feels as a stutter. */
+static void fps_report_tick(void)
+{
+    LARGE_INTEGER now;
+    double dt_ms;
+    if (!s_fps_report || !s_fps_qpc_frequency.QuadPart)
+        return;
+    QueryPerformanceCounter(&now);
+    if (!s_fps_last_qpc.QuadPart) {
+        s_fps_last_qpc = now;
+        return;
+    }
+    dt_ms = (double)(now.QuadPart - s_fps_last_qpc.QuadPart) * 1000.0 /
+            (double)s_fps_qpc_frequency.QuadPart;
+    s_fps_last_qpc = now;
+    s_fps_frames++;
+    s_fps_draws += s_draw_count;
+    s_fps_elapsed_ms += dt_ms;
+    if (s_fps_frame_ms_len < (uint32_t)(sizeof s_fps_frame_ms /
+                                        sizeof s_fps_frame_ms[0]))
+        s_fps_frame_ms[s_fps_frame_ms_len++] = (uint32_t)(dt_ms + 0.5);
+    if (s_fps_elapsed_ms < (double)s_fps_report * 1000.0)
+        return;
+    {
+        uint32_t sorted[600], i, j, n = s_fps_frame_ms_len;
+        double fps = s_fps_frames * 1000.0 / s_fps_elapsed_ms;
+        for (i = 0; i < n; i++) sorted[i] = s_fps_frame_ms[i];
+        for (i = 1; i < n; i++) {   /* insertion sort, n <= 600 per report */
+            uint32_t v = sorted[i];
+            for (j = i; j > 0 && sorted[j - 1] > v; j--)
+                sorted[j] = sorted[j - 1];
+            sorted[j] = v;
+        }
+        fprintf(stderr,
+            "[D3D11-FPS] frames=%u fps=%.2f avg_ms=%.2f p50_ms=%u p95_ms=%u "
+            "max_ms=%u draws_per_frame=%.1f\n",
+            s_fps_frames, fps, s_fps_elapsed_ms / (double)s_fps_frames,
+            n ? sorted[n / 2] : 0u, n ? sorted[(n * 95u) / 100u] : 0u,
+            n ? sorted[n - 1u] : 0u,
+            s_fps_frames ? (double)s_fps_draws / (double)s_fps_frames : 0.0);
+        fflush(stderr);
+    }
+    s_fps_frames = 0;
+    s_fps_draws = 0;
+    s_fps_elapsed_ms = 0.0;
+    s_fps_frame_ms_len = 0;
+}
+
 static int upload_texture(const Nv2aTexture *t)
 {
     D3D11_TEXTURE2D_DESC td;
@@ -1076,7 +1463,7 @@ static int upload_texture(const Nv2aTexture *t)
             t->offset, t->width, t->height, t->color & 0xFF, s_frame_count);
         s_sky_texture_route_mask |= 2u;
     }
-    for (i = 0; i < sizeof(s_tex_cache) / sizeof(s_tex_cache[0]); i++) {
+    for (i = 0; i < texture_cache_slots(); i++) {
         D3DTextureCacheEntry *entry = &s_tex_cache[i];
         if (entry->texture && entry->offset == t->offset && entry->width == t->width &&
             entry->height == t->height && entry->pitch == t->pitch &&
@@ -1148,6 +1535,8 @@ static int upload_texture(const Nv2aTexture *t)
         free(pixels);
         return 0;
     }
+    if (panel_trace_enabled())
+        dump_panel_texture_once(t, pixels);
     if (t->offset == 0x82809000 && sky_texture_trace_enabled()) {
         static unsigned sky_decode_trace_count;
         if (sky_decode_trace_count < 8) {
@@ -1192,7 +1581,7 @@ static int upload_texture(const Nv2aTexture *t)
     }
     if (generate_mips)
         ID3D11DeviceContext_GenerateMips(s_ctx, srv);
-    for (i = 1; i < sizeof(s_tex_cache) / sizeof(s_tex_cache[0]); i++) {
+    for (i = 1; i < texture_cache_slots(); i++) {
         if (!s_tex_cache[i].texture) { slot = i; break; }
         if (!s_tex_cache[i].age || s_tex_cache[i].age < s_tex_cache[slot].age) slot = i;
     }
@@ -1471,6 +1860,17 @@ static void d3d11_draw_impl(const Nv2aSurface *surface, const Nv2aBatch *batch)
     static int force_simple_preview_scene = -1;
     static int simple_scene_logged;
     static unsigned trace_sky_target_draws;
+    static int force_shadow_blend = -1;
+    static unsigned shadow_blend_override_count;
+    static int force_far_racer_alpha_off = -1;
+    static unsigned far_racer_alpha_override_count;
+    static int force_actor_no_depth = -1;
+    static unsigned actor_no_depth_override_count;
+    static int force_actor_alpha_test_off = -1;
+    static unsigned actor_alpha_override_count, actor_alpha_last_frame;
+    static unsigned actor_alpha_frame_logs;
+    static int actor_alpha_capture_on_match = -1;
+    static int actor_alpha_capture_requested;
     D3D11_MAPPED_SUBRESOURCE map;
     D3D11_VIEWPORT vp;
     UINT stride = sizeof(D3DVertex), offset = 0;
@@ -1484,9 +1884,21 @@ static void d3d11_draw_impl(const Nv2aSurface *surface, const Nv2aBatch *batch)
     const char *skip_preview_env;
     const char *simple_preview_env;
     const char *simple_scene_env;
+    const char *shadow_blend_env;
+    const char *far_racer_alpha_env;
+    const char *actor_no_depth_env;
+    const char *actor_alpha_env;
+    const char *actor_alpha_capture_env;
+    Nv2aRenderState shadow_blend_state;
+    Nv2aRenderState actor_depth_state;
+    const Nv2aRenderState *render_state;
+    const Nv2aTexture *shadow_tex0, *shadow_tex1;
+    float far_racer_xmin, far_racer_xmax, far_racer_ymin, far_racer_ymax;
     uint32_t previous_surface_va;
     int textured, any_texture = 0, st, preview_composite_override = 0;
     int preview_scene_override = 0;
+    int far_racer_alpha_override = 0;
+    int actor_alpha_test_override = 0;
     uint32_t i;
     LARGE_INTEGER perf_stage_last;
     (void)surface;
@@ -1500,6 +1912,8 @@ static void d3d11_draw_impl(const Nv2aSurface *surface, const Nv2aBatch *batch)
     s_color_va = surface->color_va;
     s_pitch = surface->pitch;
     if (!s_active) return;
+    if (!s_panel_frame_dump_done && (GetAsyncKeyState(VK_F12) & 0x8000))
+        s_panel_frame_capture_requested = 1;
     if (!init_gpu_objects()) return;
     if (!select_direct_surface(surface)) return;
     if (previous_surface_va != s_active_surface_va)
@@ -1518,6 +1932,32 @@ static void d3d11_draw_impl(const Nv2aSurface *surface, const Nv2aBatch *batch)
         simple_scene_env = getenv("RECOMP_D3D_SIMPLE_PREVIEW_SCENE");
         force_simple_preview_scene = simple_scene_env && simple_scene_env[0] &&
                                      simple_scene_env[0] != '0';
+    }
+    if (force_shadow_blend < 0) {
+        shadow_blend_env = getenv("RECOMP_D3D_FORCE_SHADOW_BLEND");
+        force_shadow_blend = shadow_blend_env && shadow_blend_env[0] &&
+                             shadow_blend_env[0] != '0';
+    }
+    if (force_actor_no_depth < 0) {
+        actor_no_depth_env = getenv("RECOMP_D3D_FORCE_ACTOR_NO_DEPTH");
+        force_actor_no_depth = actor_no_depth_env && actor_no_depth_env[0] &&
+                               actor_no_depth_env[0] != '0';
+    }
+    if (force_actor_alpha_test_off < 0) {
+        actor_alpha_env = getenv("RECOMP_D3D_FORCE_ACTOR_ALPHA_TEST_OFF");
+        force_actor_alpha_test_off = actor_alpha_env && actor_alpha_env[0] &&
+                                     actor_alpha_env[0] != '0';
+    }
+    if (actor_alpha_capture_on_match < 0) {
+        actor_alpha_capture_env = getenv("RECOMP_D3D_CAPTURE_ON_ACTOR_ALPHA_MATCH");
+        actor_alpha_capture_on_match = actor_alpha_capture_env &&
+                                       actor_alpha_capture_env[0] &&
+                                       actor_alpha_capture_env[0] != '0';
+    }
+    if (force_far_racer_alpha_off < 0) {
+        far_racer_alpha_env = getenv("RECOMP_D3D_FORCE_FAR_RACER_ALPHA_OFF");
+        force_far_racer_alpha_off = far_racer_alpha_env && far_racer_alpha_env[0] &&
+                                    far_racer_alpha_env[0] != '0';
     }
     if (skip_preview_composite && surface->width >= 512 && batch) {
         const Nv2aTexture *preview_tex = batch->textures[0] ?
@@ -1546,6 +1986,68 @@ static void d3d11_draw_impl(const Nv2aSurface *surface, const Nv2aBatch *batch)
                 batch && batch->texture ? "yes" : "no");
     }
     if (!batch || !batch->vertices || batch->count < 3) return;
+    far_racer_alpha_override = 0;
+    shadow_tex0 = batch->textures[0] ? batch->textures[0] : batch->texture;
+    shadow_tex1 = batch->textures[1];
+    if (force_far_racer_alpha_off && surface->width == 640 && surface->height == 480 &&
+        batch->state && batch->state->alpha_test_enable && !batch->state->blend_enable &&
+        batch->state->alpha_func == 0x0206 && batch->state->alpha_ref == 128 &&
+        batch->count == 216 && shadow_tex0 && shadow_tex1 &&
+        shadow_tex0->color == 0x0C && shadow_tex0->width == 128 &&
+        shadow_tex0->height == 128 && shadow_tex1->color == 0x0F &&
+        shadow_tex1->width == 64 && shadow_tex1->height == 128 &&
+        (batch->vertices[0].diffuse >> 24) == 0xFF) {
+        far_racer_xmin = far_racer_xmax = batch->vertices[0].x;
+        far_racer_ymin = far_racer_ymax = batch->vertices[0].y;
+        for (i = 1; i < batch->count; i++) {
+            if (batch->vertices[i].x < far_racer_xmin) far_racer_xmin = batch->vertices[i].x;
+            if (batch->vertices[i].x > far_racer_xmax) far_racer_xmax = batch->vertices[i].x;
+            if (batch->vertices[i].y < far_racer_ymin) far_racer_ymin = batch->vertices[i].y;
+            if (batch->vertices[i].y > far_racer_ymax) far_racer_ymax = batch->vertices[i].y;
+        }
+        if (far_racer_xmax - far_racer_xmin <= 32.0f &&
+            far_racer_ymax - far_racer_ymin <= 32.0f && far_racer_ymin < 160.0f) {
+            far_racer_alpha_override = 1;
+            if (far_racer_alpha_override_count < 16u) {
+                fprintf(stderr,
+                    "[D3D11-FAR-ALPHA-AB] match=%u frame=%u surface=0x%08X verts=%u xy=[%.2f..%.2f,%.2f..%.2f] tex0=0x%08X tex1=0x%08X guest_alpha=1 test_alpha=0\n",
+                    far_racer_alpha_override_count + 1, s_frame_count + 1,
+                    surface->color_va, batch->count, far_racer_xmin, far_racer_xmax,
+                    far_racer_ymin, far_racer_ymax, shadow_tex0->offset,
+                    shadow_tex1->offset);
+            }
+            far_racer_alpha_override_count++;
+        }
+    }
+    if (force_actor_alpha_test_off && surface->width == 640 && surface->height == 480 &&
+        batch->state && batch->state->alpha_test_enable && batch->count >= 48 &&
+        batch->count <= 512 && batch->combiner &&
+        batch->combiner->control == 0x00011108u && shadow_tex0 && shadow_tex1 &&
+        ((shadow_tex0->color & 0xFF) == 0x0C ||
+         (shadow_tex0->color & 0xFF) == 0x0F) &&
+        (shadow_tex1->color & 0xFF) == 0x0F) {
+        uint32_t frame_now = s_frame_count + 1;
+        actor_alpha_test_override = 1;
+        if (actor_alpha_capture_on_match && !actor_alpha_capture_requested) {
+            s_panel_frame_capture_requested = 1;
+            actor_alpha_capture_requested = 1;
+            fprintf(stderr, "[D3D11-ACTOR-ALPHA-AB] automatic frame capture requested on first matching draw\n");
+        }
+        if (actor_alpha_last_frame != frame_now) {
+            actor_alpha_last_frame = frame_now;
+            actor_alpha_frame_logs = 0;
+        }
+        if (actor_alpha_override_count < 128u && actor_alpha_frame_logs < 4u) {
+            fprintf(stderr, "[D3D11-ACTOR-ALPHA-AB] frame=%u draw=%u verts=%u tex0=0x%08X/fmt%02X tex1=0x%08X/fmt%02X guest_alpha=1 func=0x%X ref=%u test_alpha=off depth=%u\n",
+                    frame_now, s_draw_count, batch->count,
+                    shadow_tex0->offset, shadow_tex0->color & 0xFF,
+                    shadow_tex1->offset, shadow_tex1->color & 0xFF,
+                    batch->state->alpha_func, batch->state->alpha_ref & 0xFF,
+                    batch->state->depth_test_enable);
+            actor_alpha_override_count++;
+            actor_alpha_frame_logs++;
+        }
+    }
     if (sky_texture_trace_enabled() && surface->color_va == 0x82809000 &&
         trace_sky_target_draws < 16u) {
         const Nv2aTexture *target_tex = batch->textures[0] ?
@@ -1709,7 +2211,9 @@ static void d3d11_draw_impl(const Nv2aSurface *surface, const Nv2aBatch *batch)
         }
     }
     cb.reserved0 = cb.reserved1 = 0.0f;
-    cb.alpha_test = batch->state && batch->state->alpha_test_enable ? 1.0f : 0.0f;
+    cb.alpha_test = batch->state && batch->state->alpha_test_enable &&
+                    !far_racer_alpha_override && !actor_alpha_test_override ?
+                    1.0f : 0.0f;
     cb.alpha_func = batch->state ? (float)batch->state->alpha_func : 0x0207;
     cb.alpha_ref = batch->state ? (float)(batch->state->alpha_ref & 0xFF) / 255.0f : 0.0f;
     cb.reserved2 = s_raw_texture ? 1.0f : 0.0f;
@@ -1742,10 +2246,12 @@ static void d3d11_draw_impl(const Nv2aSurface *surface, const Nv2aBatch *batch)
             rc_cb.alpha_ref = batch->state ?
                 (float)(batch->state->alpha_ref & 0xFF) / 255.0f : 0.0f;
             rc_cb.alpha_func = (func >= 0x200 && func <= 0x207) ? func - 0x1FF : 8;
-            rc_cb.alpha_test_enable = batch->state && batch->state->alpha_test_enable;
+            rc_cb.alpha_test_enable = batch->state && batch->state->alpha_test_enable &&
+                                      !far_racer_alpha_override &&
+                                      !actor_alpha_test_override;
             rc_cb.fog_enable = batch->state ? batch->state->fog_enable : 0;
-            /* NV097 0x06 is full-color A8R8G8B8; A8-only uses 0x19. */
             for (i = 0; i < NV2A_MAX_TEXTURES; i++)
+                /* 0x06 is full-color A8R8G8B8; only 0x19 is alpha-only A8. */
                 rc_cb.alpha_only[i] = tex_stage[i] &&
                     (tex_stage[i]->color & 0xFF) ==
                         NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8;
@@ -1776,26 +2282,69 @@ static void d3d11_draw_impl(const Nv2aSurface *surface, const Nv2aBatch *batch)
                                                      D3D11_MAP_WRITE_DISCARD,
                                        0, &map))) return;
     if (s_perf_trace) perf_stage_record(3, &perf_stage_last);
-    for (i = 0; i < batch->count; i++) {
-        const Nv2aVertex *v = &batch->vertices[i];
-        D3DVertex *o = &((D3DVertex *)map.pData)[s_vb_cursor + i];
-        o->x = v->x; o->y = v->y; o->z = d3d_depth_value(v->z); o->rhw = v->rhw;
-        o->color[0] = ((v->diffuse >> 16) & 255) / 255.0f;
-        o->color[1] = ((v->diffuse >> 8) & 255) / 255.0f;
-        o->color[2] = (v->diffuse & 255) / 255.0f;
-        o->color[3] = ((v->diffuse >> 24) & 255) / 255.0f;
-        o->specular[0] = ((v->specular >> 16) & 255) / 255.0f;
-        o->specular[1] = ((v->specular >> 8) & 255) / 255.0f;
-        o->specular[2] = (v->specular & 255) / 255.0f;
-        o->specular[3] = ((v->specular >> 24) & 255) / 255.0f;
-        o->fog = v->fog;
-        for (st = 0; st < 4; st++) {
-            uint32_t mode = batch->combiner ?
-                ((batch->combiner->stage_program >> (st * 5)) & 0x1F) : 0;
-            o->tex[st][0] = v->tex[st][0];
-            o->tex[st][1] = v->tex[st][1];
-            o->tex[st][2] = mode == 3 ? v->tex[st][2] : v->tex[st][3];
-            o->tex[st][3] = v->tex[st][2];
+    {
+        static int actor_fog_ab_enabled = -1;
+        static uint32_t actor_fog_ab_logs, actor_fog_ab_last_frame;
+        static uint32_t actor_fog_ab_frame_logs;
+        const char *actor_fog_env;
+        int force_actor_fog = 0;
+        float fog_min = 0.0f, fog_max = 0.0f;
+        if (actor_fog_ab_enabled < 0) {
+            actor_fog_env = getenv("RECOMP_D3D_FORCE_ACTOR_FOG");
+            actor_fog_ab_enabled = actor_fog_env && actor_fog_env[0] &&
+                                   actor_fog_env[0] != '0';
+        }
+        if (actor_fog_ab_enabled && surface->width == 640 && surface->height == 480 &&
+            batch->count >= 48 && batch->count <= 512 && batch->combiner &&
+            batch->combiner->control == 0x00011108u && tex_stage[0] && tex_stage[1] &&
+            ((tex_stage[0]->color & 0xFF) == 0x0C ||
+             (tex_stage[0]->color & 0xFF) == 0x0F) &&
+            (tex_stage[1]->color & 0xFF) == 0x0F)
+            force_actor_fog = 1;
+        for (i = 0; i < batch->count; i++) {
+            const Nv2aVertex *v = &batch->vertices[i];
+            D3DVertex *o = &((D3DVertex *)map.pData)[s_vb_cursor + i];
+            if (i == 0) fog_min = fog_max = v->fog;
+            else {
+                if (v->fog < fog_min) fog_min = v->fog;
+                if (v->fog > fog_max) fog_max = v->fog;
+            }
+            o->x = v->x; o->y = v->y; o->z = d3d_depth_value(v->z); o->rhw = v->rhw;
+            o->color[0] = ((v->diffuse >> 16) & 255) / 255.0f;
+            o->color[1] = ((v->diffuse >> 8) & 255) / 255.0f;
+            o->color[2] = (v->diffuse & 255) / 255.0f;
+            o->color[3] = ((v->diffuse >> 24) & 255) / 255.0f;
+            o->specular[0] = ((v->specular >> 16) & 255) / 255.0f;
+            o->specular[1] = ((v->specular >> 8) & 255) / 255.0f;
+            o->specular[2] = (v->specular & 255) / 255.0f;
+            o->specular[3] = ((v->specular >> 24) & 255) / 255.0f;
+            o->fog = force_actor_fog ? 1.0f : v->fog;
+            for (st = 0; st < 4; st++) {
+                uint32_t mode = batch->combiner ?
+                    ((batch->combiner->stage_program >> (st * 5)) & 0x1F) : 0;
+                o->tex[st][0] = v->tex[st][0];
+                o->tex[st][1] = v->tex[st][1];
+                o->tex[st][2] = mode == 3 ? v->tex[st][2] : v->tex[st][3];
+                o->tex[st][3] = v->tex[st][2];
+            }
+        }
+        if (force_actor_fog) {
+            uint32_t frame_now = s_frame_count + 1;
+            if (actor_fog_ab_last_frame != frame_now) {
+                actor_fog_ab_last_frame = frame_now;
+                actor_fog_ab_frame_logs = 0;
+            }
+            if (actor_fog_ab_logs < 128 && actor_fog_ab_frame_logs < 4) {
+            fprintf(stderr, "[D3D11-ACTOR-FOG-AB] frame=%u draw=%u verts=%u tex0=0x%08X/fmt%02X tex1=0x%08X/fmt%02X fog=%g..%g stateFog=%u fogColor=0x%08X forced=1\n",
+                    s_frame_count + 1, s_draw_count, batch->count,
+                    tex_stage[0]->offset, tex_stage[0]->color & 0xFF,
+                    tex_stage[1]->offset, tex_stage[1]->color & 0xFF,
+                    fog_min, fog_max,
+                    batch->state ? batch->state->fog_enable : 0,
+                    batch->state ? batch->state->fog_color : 0);
+            actor_fog_ab_logs++;
+            actor_fog_ab_frame_logs++;
+            }
         }
     }
     /* The per-vertex range scan below is diagnostic only; keep it off the
@@ -1840,7 +2389,52 @@ static void d3d11_draw_impl(const Nv2aSurface *surface, const Nv2aBatch *batch)
         s_bound_rtv = s_rtv;
         s_bound_dsv = s_dsv;
     }
-    apply_render_state(batch->state);
+    render_state = batch->state;
+    shadow_tex0 = batch->textures[0] ? batch->textures[0] : batch->texture;
+    shadow_tex1 = batch->textures[1];
+    /* Match stable texture/state metadata; guest texture VAs can move per run. */
+    if (force_shadow_blend && surface->width == 640 && surface->height == 480 &&
+        batch->state && !batch->state->blend_enable &&
+        batch->state->alpha_test_enable && batch->count <= 12 &&
+        shadow_tex0 && shadow_tex1 && shadow_tex0->color == 0x06 &&
+        shadow_tex1->color == 0x0B && shadow_tex1->offset == 0x83552000 &&
+        batch->vertices[0].diffuse == 0xFF808080) {
+        shadow_blend_state = *batch->state;
+        shadow_blend_state.blend_enable = 1;
+        render_state = &shadow_blend_state;
+        if (shadow_blend_override_count < 16u) {
+            fprintf(stderr,
+                "[D3D11-SHADOW-AB] match=%u frame=%u surface=0x%08X verts=%u tex0=0x%08X tex1=0x%08X guest_blend=%u test_blend=%u\n",
+                shadow_blend_override_count + 1, s_frame_count + 1,
+                surface->color_va, batch->count, shadow_tex0->offset,
+                shadow_tex1->offset, batch->state->blend_enable,
+                shadow_blend_state.blend_enable);
+        }
+        shadow_blend_override_count++;
+    }
+    if (force_actor_no_depth && surface->width == 640 && surface->height == 480 &&
+        batch->state && batch->state->depth_test_enable &&
+        batch->count >= 48 && batch->count <= 512 && batch->combiner &&
+        batch->combiner->control == 0x00011108u && shadow_tex0 && shadow_tex1 &&
+        ((shadow_tex0->color & 0xFF) == 0x0C ||
+         (shadow_tex0->color & 0xFF) == 0x0F) &&
+        (shadow_tex1->color & 0xFF) == 0x0F) {
+        actor_depth_state = *batch->state;
+        actor_depth_state.depth_test_enable = 0;
+        actor_depth_state.depth_write = 0;
+        render_state = &actor_depth_state;
+        if (actor_no_depth_override_count < 128u) {
+            fprintf(stderr, "[D3D11-ACTOR-DEPTH-AB] frame=%u draw=%u verts=%u tex0=0x%08X/fmt%02X tex1=0x%08X/fmt%02X guest_depth=%u func=0x%X write=%u clip_range=[%.5g..%.5g] forced_depth=off\n",
+                    s_frame_count + 1, s_draw_count, batch->count,
+                    shadow_tex0->offset, shadow_tex0->color & 0xFF,
+                    shadow_tex1->offset, shadow_tex1->color & 0xFF,
+                    batch->state->depth_test_enable, batch->state->depth_func,
+                    batch->state->depth_write,
+                    batch->state->depth_min, batch->state->depth_max);
+            actor_no_depth_override_count++;
+        }
+    }
+    apply_render_state(render_state);
     if (!s_binding_cache_valid || s_bound_vb != s_vb ||
         s_bound_vb_stride != stride || s_bound_vb_offset != offset)
         ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &s_vb, &stride, &offset);
@@ -1899,8 +2493,11 @@ static void d3d11_draw_impl(const Nv2aSurface *surface, const Nv2aBatch *batch)
                 batch->textures[0] != NULL || batch->texture != NULL);
         s_batch_trace_samples++;
     }
-    if (batch_trace_enabled() >= 2 && s_frame_count >= 900 &&
-        (s_frame_count % 10) == 0 &&
+    /* Level 3 samples the current scene only while F12 is held. */
+    if (((batch_trace_enabled() == 2 && s_frame_count >= 900 &&
+          (s_frame_count % 10) == 0) ||
+         (batch_trace_enabled() >= 3 &&
+          (GetAsyncKeyState(VK_F12) & 0x8000))) &&
         s_batch_trace_samples < 2048) {
         const Nv2aTexture *t0 = batch->textures[0] ? batch->textures[0] : batch->texture;
         float min_x = 0.0f, max_x = 0.0f, min_y = 0.0f, max_y = 0.0f;
@@ -1938,7 +2535,8 @@ static void d3d11_draw_impl(const Nv2aSurface *surface, const Nv2aBatch *batch)
         }
         if (invalid)
             model_like = 1;
-        if (model_like) {
+        /* Level 3 includes small screen-aligned quads such as shadow cards. */
+        if (model_like || batch_trace_enabled() >= 3) {
             const Nv2aTexture *t1 = batch->textures[1];
             static int raw_trace_enabled = -1;
             static int raw_trace_dumps;
@@ -1972,7 +2570,7 @@ static void d3d11_draw_impl(const Nv2aSurface *surface, const Nv2aBatch *batch)
                 }
                 raw_trace_dumps++;
             }
-            fprintf(stderr, "[D3D11-BATCH2] frame=%u surface=%ux%u color=0x%08X pitch=%u bpp=%u aa=%ux%u callback=%u draw=%u verts=%u finite=%u invalid=%u xy=[%.2f..%.2f,%.2f..%.2f] z=[%.5g..%.5g] rhw=[%.5g..%.5g] depth=%u cull=%u face=0x%X blend=%u src=0x%X dst=0x%X eq=0x%X mask=0x%08X alpha_test=%u alpha_func=0x%X alpha_ref=%u rc=0x%08X prog=0x%08X icw0=0x%08X/0x%08X ocw0=0x%08X/0x%08X final=0x%08X/0x%08X tex=%s off=0x%08X %ux%u texpitch=%u fmt=0x%02X tex1=%s off1=0x%08X %ux%u fmt1=0x%02X srv=%u/%u\n",
+            fprintf(stderr, "[D3D11-BATCH2] frame=%u surface=%ux%u color=0x%08X pitch=%u bpp=%u aa=%ux%u callback=%u draw=%u verts=%u finite=%u invalid=%u xy=[%.2f..%.2f,%.2f..%.2f] z=[%.5g..%.5g] rhw=[%.5g..%.5g] depth=%u cull=%u face=0x%X blend=%u src=0x%X dst=0x%X eq=0x%X mask=0x%08X alpha_test=%u alpha_func=0x%X alpha_ref=%u rc=0x%08X prog=0x%08X icw0=0x%08X/0x%08X ocw0=0x%08X/0x%08X final=0x%08X/0x%08X tex=%s off=0x%08X %ux%u texpitch=%u fmt=0x%02X tex1=%s off1=0x%08X %ux%u fmt1=0x%02X srv=%u/%u diffuse0=%08X uv0=(%.3f,%.3f) alpha_only0=%u alpha_only1=%u\n",
                     s_frame_count + 1, surface->width, surface->height,
                     surface->color_va, surface->pitch, surface->bytes_per_pixel,
                     surface->aa_sx, surface->aa_sy,
@@ -2004,16 +2602,103 @@ static void d3d11_draw_impl(const Nv2aSurface *surface, const Nv2aBatch *batch)
                     t1 ? "yes" : "no", t1 ? t1->offset : 0,
                     t1 ? t1->width : 0, t1 ? t1->height : 0,
                     t1 ? t1->color & 0xFF : 0,
-                    srvs[0] != NULL, srvs[1] != NULL);
+                    srvs[0] != NULL, srvs[1] != NULL,
+                    batch->vertices[0].diffuse,
+                    batch->vertices[0].tex[0][0], batch->vertices[0].tex[0][1],
+                    t0 && (t0->color & 0xFF) == NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8 ? 1u : 0u,
+                    t1 && (t1->color & 0xFF) == NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8 ? 1u : 0u);
+            {
+                static int actor_probe_enabled = -1;
+                static unsigned actor_probe_samples;
+                const char *actor_probe_env;
+                if (actor_probe_enabled < 0) {
+                    actor_probe_env = getenv("RECOMP_D3D_ACTOR_TRACE");
+                    actor_probe_enabled = actor_probe_env && actor_probe_env[0] &&
+                                          actor_probe_env[0] != '0';
+                }
+                if (actor_probe_enabled && actor_probe_samples < 256 &&
+                    (GetAsyncKeyState(VK_F12) & 0x8000) &&
+                    surface->width == 640 && surface->height == 480 &&
+                    batch->count >= 48 && batch->count <= 512 &&
+                    (max_x - min_x) <= 80.0f && (max_y - min_y) <= 80.0f &&
+                    min_y < 200.0f) {
+                    uint32_t k, zero_alpha = 0, min_alpha = 255, max_alpha = 0;
+                    float u0min = 0.0f, u0max = 0.0f, v0min = 0.0f, v0max = 0.0f;
+                    float u1min = 0.0f, u1max = 0.0f, v1min = 0.0f, v1max = 0.0f;
+                    float vertex_fog_min = 0.0f, vertex_fog_max = 0.0f;
+                    for (k = 0; k < batch->count; ++k) {
+                        const Nv2aVertex *av = &batch->vertices[k];
+                        uint32_t alpha = (av->diffuse >> 24) & 0xFF;
+                        if (alpha == 0) zero_alpha++;
+                        if (alpha < min_alpha) min_alpha = alpha;
+                        if (alpha > max_alpha) max_alpha = alpha;
+                        if (k == 0) {
+                            u0min = u0max = av->tex[0][0]; v0min = v0max = av->tex[0][1];
+                            u1min = u1max = av->tex[1][0]; v1min = v1max = av->tex[1][1];
+                            vertex_fog_min = vertex_fog_max = av->fog;
+                        } else {
+                            if (av->tex[0][0] < u0min) u0min = av->tex[0][0];
+                            if (av->tex[0][0] > u0max) u0max = av->tex[0][0];
+                            if (av->tex[0][1] < v0min) v0min = av->tex[0][1];
+                            if (av->tex[0][1] > v0max) v0max = av->tex[0][1];
+                            if (av->tex[1][0] < u1min) u1min = av->tex[1][0];
+                            if (av->tex[1][0] > u1max) u1max = av->tex[1][0];
+                            if (av->tex[1][1] < v1min) v1min = av->tex[1][1];
+                            if (av->tex[1][1] > v1max) v1max = av->tex[1][1];
+                            if (av->fog < vertex_fog_min) vertex_fog_min = av->fog;
+                            if (av->fog > vertex_fog_max) vertex_fog_max = av->fog;
+                        }
+                    }
+                    fprintf(stderr, "[D3D11-ACTOR-PROBE] frame=%u draw=%u verts=%u xy=[%.2f..%.2f,%.2f..%.2f] z=[%.5g..%.5g] rhw=[%.5g..%.5g] tex=0x%08X/fmt%02X tex1=0x%08X/fmt%02X diffuse0=%08X alpha=%u..%u zero_alpha=%u uv0=[%.3f..%.3f,%.3f..%.3f] uv1=[%.3f..%.3f,%.3f..%.3f] combiner=0x%08X depth=%u cull=%u blend=%u alpha_test=%u/%u/%u vertexFog=%.5g..%.5g fogState=%u fogColor=0x%08X\n",
+                            s_frame_count + 1, s_draw_count, batch->count,
+                            min_x, max_x, min_y, max_y, min_z, max_z, min_w, max_w,
+                            t0 ? t0->offset : 0, t0 ? t0->color & 0xFF : 0,
+                            t1 ? t1->offset : 0, t1 ? t1->color & 0xFF : 0,
+                            batch->vertices[0].diffuse, min_alpha, max_alpha, zero_alpha,
+                            u0min, u0max, v0min, v0max, u1min, u1max, v1min, v1max,
+                            batch->combiner ? batch->combiner->control : 0,
+                            batch->state ? batch->state->depth_test_enable : 0,
+                            batch->state ? batch->state->cull_enable : 0,
+                            batch->state ? batch->state->blend_enable : 0,
+                            batch->state ? batch->state->alpha_test_enable : 0,
+                            batch->state ? batch->state->alpha_func : 0,
+                            batch->state ? batch->state->alpha_ref : 0,
+                            vertex_fog_min, vertex_fog_max,
+                            batch->state ? batch->state->fog_enable : 0,
+                            batch->state ? batch->state->fog_color : 0);
+                    if (batch->combiner) {
+                        uint32_t stage, stage_count = batch->combiner->control & 0xFF;
+                        if (stage_count > NV2A_MAX_COMBINER_STAGES)
+                            stage_count = NV2A_MAX_COMBINER_STAGES;
+                        fprintf(stderr, "[D3D11-ACTOR-FINAL] frame=%u draw=%u stages=%u prog=0x%08X final=0x%08X/0x%08X const=0x%08X/0x%08X\n",
+                                s_frame_count + 1, s_draw_count, stage_count,
+                                batch->combiner->stage_program,
+                                batch->combiner->final0, batch->combiner->final1,
+                                batch->combiner->final_c0, batch->combiner->final_c1);
+                        for (stage = 0; stage < stage_count; ++stage) {
+                            uint32_t tex_mode = stage < 6 ?
+                                ((batch->combiner->stage_program >> (stage * 5)) & 0x1F) : 0;
+                            fprintf(stderr, "[D3D11-ACTOR-COMB] frame=%u draw=%u stage=%u texmode=%u rgbicw=0x%08X alphaicw=0x%08X rgbocw=0x%08X alphaocw=0x%08X c0=0x%08X c1=0x%08X\n",
+                                    s_frame_count + 1, s_draw_count, stage, tex_mode,
+                                    batch->combiner->color_icw[stage],
+                                    batch->combiner->alpha_icw[stage],
+                                    batch->combiner->color_ocw[stage],
+                                    batch->combiner->alpha_ocw[stage],
+                                    batch->combiner->factor0[stage],
+                                    batch->combiner->factor1[stage]);
+                        }
+                    }
+                    actor_probe_samples++;
+                }
+            }
             s_batch_trace_samples++;
         }
     }
-    if (panel_trace_enabled() && s_panel_trace_samples < 4096 &&
+    if (panel_trace_enabled() &&
+        (s_panel_trace_samples < 1024 ||
+         (s_records_trace_samples < 256 && (GetAsyncKeyState(VK_F12) & 0x8000))) &&
         batch->vertices && batch->count &&
-        surface->width >= 640 && surface->height >= 480 &&
-        surface->width <= 1280 && surface->height <= 960 &&
-        surface->width * 3u >= surface->height * 4u &&
-        surface->width * 3u <= surface->height * 4u) {
+        surface->width == 640 && surface->height == 480) {
         const Nv2aTexture *pt0 = batch->textures[0] ? batch->textures[0] : batch->texture;
         const Nv2aTexture *pt1 = batch->textures[1];
         float min_x = batch->vertices[0].x, max_x = min_x;
@@ -2026,9 +2711,45 @@ static void d3d11_draw_impl(const Nv2aSurface *surface, const Nv2aBatch *batch)
             if (v->y < min_y) min_y = v->y;
             if (v->y > max_y) max_y = v->y;
         }
-        if (pt0 && min_x < (float)surface->width * 0.42f &&
-            max_x >= 0.0f && max_y >= (float)surface->height * 0.08f &&
-            min_y < (float)surface->height * 0.98f) {
+        if ((GetAsyncKeyState(VK_F12) & 0x8000) &&
+            s_records_trace_samples < 256 &&
+            min_x <= 174.0f && max_x >= 6.0f &&
+            ((min_y <= 233.0f && max_y >= 176.0f) ||
+             (min_y <= 303.0f && max_y >= 246.0f) ||
+             (min_y <= 374.0f && max_y >= 316.0f))) {
+            const Nv2aVertex *record_v = &batch->vertices[0];
+            const Nv2aTexture *record_t0 = batch->textures[0] ?
+                batch->textures[0] : batch->texture;
+            const Nv2aTexture *record_t1 = batch->textures[1];
+            fprintf(stderr,
+                "[D3D11-RECORDS] frame=%u target=0x%08X draw=%u verts=%u xy=[%.1f..%.1f,%.1f..%.1f] tex0=0x%08X %ux%u fmt=0x%02X srv0=%u tex1=0x%08X %ux%u fmt1=0x%02X srv1=%u blend=%u src=0x%X dst=0x%X alpha_test=%u aref=%u depth=%u zwrite=%u mask=0x%08X rc=0x%08X prog=0x%08X diffuse=%08X uv=(%.3f,%.3f)\n",
+                s_frame_count + 1, surface->color_va, s_draw_count, batch->count,
+                min_x, max_x, min_y, max_y,
+                record_t0 ? record_t0->offset : 0,
+                record_t0 ? record_t0->width : 0,
+                record_t0 ? record_t0->height : 0,
+                record_t0 ? record_t0->color & 0xFF : 0, srvs[0] != NULL,
+                record_t1 ? record_t1->offset : 0,
+                record_t1 ? record_t1->width : 0,
+                record_t1 ? record_t1->height : 0,
+                record_t1 ? record_t1->color & 0xFF : 0, srvs[1] != NULL,
+                batch->state ? batch->state->blend_enable : 0,
+                batch->state ? batch->state->blend_src : 0,
+                batch->state ? batch->state->blend_dst : 0,
+                batch->state ? batch->state->alpha_test_enable : 0,
+                batch->state ? batch->state->alpha_ref : 0,
+                batch->state ? batch->state->depth_test_enable : 0,
+                batch->state ? batch->state->depth_write : 0,
+                batch->state ? batch->state->color_mask : 0,
+                batch->combiner ? batch->combiner->control : 0,
+                batch->combiner ? batch->combiner->stage_program : 0,
+                record_v->diffuse, record_v->tex[0][0], record_v->tex[0][1]);
+            s_records_trace_samples++;
+        }
+        if (pt0 && (pt0->offset == 0x8251C000 || pt0->offset == 0x82505000 ||
+                    pt0->offset == 0x824B8000 || pt0->offset == 0x824D1000) &&
+            min_x >= 100.0f && max_x <= 530.0f &&
+            min_y >= 70.0f && max_y <= 410.0f) {
             const Nv2aVertex *v = &batch->vertices[0];
             fprintf(stderr,
                 "[D3D11-PANEL] frame=%u surface=%ux%u target=0x%08X draw=%u verts=%u xy=[%.1f..%.1f,%.1f..%.1f] tex0=0x%08X %ux%u pitch=%u fmt=0x%02X levels=%u hash=%016llX srv=%u tex1=0x%08X %ux%u fmt1=0x%02X srv1=%u depth=%u depthfunc=0x%X zwrite=%u blend=%u src=0x%X dst=0x%X eq=0x%X mask=0x%08X alpha=%u afunc=0x%X aref=%u rc=0x%08X prog=0x%08X rgb0=0x%08X alpha0=0x%08X rgbout0=0x%08X alphaout0=0x%08X final=0x%08X/0x%08X color0=%08X uv0=(%.3f,%.3f)\n",
@@ -2105,6 +2826,19 @@ static void d3d11_flip(void)
         (s_direct && !s_swap_chain)) return;
     if (s_direct) {
         gpu_present_draw_video_overlay();
+        fps_report_tick();
+        frame_dump_tick();
+        {
+            const char *panel_frame_dump_path =
+                getenv("RECOMP_D3D_PANEL_FRAME_DUMP_PATH");
+            if (panel_frame_dump_path && panel_frame_dump_path[0] &&
+                !s_panel_frame_dump_done &&
+                (s_panel_frame_capture_requested ||
+                 (GetAsyncKeyState(VK_F12) & 0x8000))) {
+                s_panel_frame_capture_requested = 0;
+                dump_panel_frame_once(panel_frame_dump_path);
+            }
+        }
         if (s_perf_trace)
             QueryPerformanceCounter(&present_start);
         HRESULT hr = IDXGISwapChain_Present(s_swap_chain, 0, 0);
@@ -2134,7 +2868,7 @@ static void d3d11_flip(void)
         s_frame_count++;
         s_vb_cursor = 0;
         if (s_perf_trace) {
-            if (s_perf_report_count < 16u && s_draw_count >= 900u) {
+            if (s_draw_count >= 900u) {
                 double draw_ms = (double)s_perf_draw_ticks * 1000.0 /
                                  (double)s_perf_qpc_frequency.QuadPart;
                 double present_ms = (double)s_perf_present_ticks * 1000.0 /
@@ -2144,6 +2878,33 @@ static void d3d11_flip(void)
                 double other_ms = frame_wall_ms - draw_ms - present_ms;
                 if (other_ms < 0.0)
                     other_ms = 0.0;
+                /* Split the time the renderer did not account for into our
+                 * own pushbuffer walk and everything else (guest code). */
+                {
+                    extern double nv2a_pb_walk_ms_take(void);
+                    extern uint32_t nv2a_pb_walk_entries;
+                    double walk_ms = nv2a_pb_walk_ms_take();
+                    double guest_ms = other_ms - walk_ms;
+                    uint32_t walk_entries = nv2a_pb_walk_entries;
+                    nv2a_pb_walk_entries = 0;
+                    if (guest_ms < 0.0)
+                        guest_ms = 0.0;
+                    fprintf(stderr,
+                        "[D3D11-SPLIT] frame=%u other_ms=%.3f walk_ms=%.3f guest_ms=%.3f walk_entries=%u\n",
+                        s_frame_count, other_ms, walk_ms, guest_ms, walk_entries);
+                }
+                {
+                    extern void nv2a_xf_profile_take(double *, double *, double *, uint64_t *);
+                    double fetch_ms = 0.0, vsh_ms = 0.0, batch_ms = 0.0;
+                    uint64_t instr = 0;
+                    nv2a_xf_profile_take(&fetch_ms, &vsh_ms, &batch_ms, &instr);
+                    if (fetch_ms > 0.0 || vsh_ms > 0.0 || batch_ms > 0.0)
+                        fprintf(stderr,
+                            "[D3D11-XF] frame=%u batch_ms=%.3f fetch_ms=%.3f vsh_ms=%.3f assemble_ms=%.3f instr=%llu vsh_ns_per_instr=%.2f\n",
+                            s_frame_count, batch_ms, fetch_ms, vsh_ms,
+                            batch_ms - fetch_ms - vsh_ms, (unsigned long long)instr,
+                            instr ? vsh_ms * 1000000.0 / (double)instr : 0.0);
+                }
                 fprintf(stderr,
                     "[D3D11-PERF] heavy_frame=%u callbacks=%u draws=%u frame_wall_ms=%.3f draw_cpu_ms=%.3f present_ms=%.3f other_ms=%.3f stage_ms=setup:%.3f,texture:%.3f,combiner_cb:%.3f,vertex_map:%.3f,vertex_copy:%.3f,vertex_unmap:%.3f,bind_draw:%.3f tex_calls=%u rt_hits=%u cache_hits=%u cache_misses=%u hashes=%u refreshes=%u dynamic_decodes=%u full_decodes=%u vertices=%u\n",
                     s_frame_count, s_frame_callbacks, s_draw_count,
@@ -2256,6 +3017,29 @@ int nv2a_backend_d3d11_init(void)
     if (s_trace_render_targets)
         fprintf(stderr, "[D3D11-BACKEND] direct target eviction trace enabled\n");
     s_raw_texture = getenv("RECOMP_D3D_RAW_TEXTURE") && getenv("RECOMP_D3D_RAW_TEXTURE")[0] != '0';
+    {
+        const char *dump_prefix = getenv("RECOMP_D3D_FRAME_DUMP");
+        const char *dump_every = getenv("RECOMP_D3D_FRAME_DUMP_EVERY");
+        const char *fps_report = getenv("RECOMP_D3D_FPS_REPORT");
+        s_fb_dump_prefix = (dump_prefix && dump_prefix[0]) ? dump_prefix : NULL;
+        s_fb_dump_every = (dump_every && *dump_every)
+                              ? (uint32_t)strtoul(dump_every, NULL, 10) : 60u;
+        if (!s_fb_dump_every) s_fb_dump_every = 60u;
+        s_fb_dump_seq = 0;
+        s_fps_report = (fps_report && *fps_report) ? atoi(fps_report) : 0;
+        if (s_fps_report < 0) s_fps_report = 0;
+        s_fps_frames = s_fps_draws = 0;
+        s_fps_frame_ms_len = 0;
+        s_fps_elapsed_ms = 0.0;
+        s_fps_last_qpc.QuadPart = 0;
+        QueryPerformanceFrequency(&s_fps_qpc_frequency);
+        if (s_fb_dump_prefix)
+            fprintf(stderr, "[D3D11-BACKEND] frame capture every %u frames to %s%%05u.bmp\n",
+                    s_fb_dump_every, s_fb_dump_prefix);
+        if (s_fps_report)
+            fprintf(stderr, "[D3D11-BACKEND] wall-clock frame pacing every %ds\n",
+                    s_fps_report);
+    }
     s_bypass_combiner = getenv("RECOMP_D3D_BYPASS_COMBINER") &&
                         getenv("RECOMP_D3D_BYPASS_COMBINER")[0] != '0';
     s_max_draws = limit && *limit ? (uint32_t)strtoul(limit, NULL, 10) :

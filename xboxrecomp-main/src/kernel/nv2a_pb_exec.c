@@ -54,6 +54,7 @@ extern uint32_t xbox_Nv2aFenceWordVa(void);
 extern int nv2a_pb_dma_walk(void);   /* nv2a_pb_scan.c: RECOMP_PB_WALK=dma */
 extern void xbox_FramebufferWindowStart(void);
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
+extern void xbox_Nv2aQueueSoftwareMethod5(void);
 
 /* Would writing this surface land on the title's own image?
  *
@@ -3151,13 +3152,51 @@ static int batch_uses_program(void)
     return (s_gpu.xf_mode & 3) == 2 && !no_vsh;
 }
 
+/* Where a transformed batch's time goes (RECOMP_XF_PROFILE=1).
+ *
+ * The backend's frame profile says the pushbuffer walk is most of a heavy
+ * frame, but not which part of it: attribute fetch, the vertex program, or
+ * triangle assembly. These three numbers say. Off by default because two
+ * clock reads per vertex are not free. */
+static int s_xf_profile = -1;
+static uint64_t s_xf_fetch_ns, s_xf_vsh_ns, s_xf_batch_ns;
+static uint64_t s_xf_instr;
+static int xf_profile_wanted(void)
+{
+    if (s_xf_profile < 0) {
+        const char *e = getenv("RECOMP_XF_PROFILE");
+        s_xf_profile = e && e[0] && e[0] != '0';
+    }
+    return s_xf_profile;
+}
+void nv2a_xf_profile_take(double *fetch_ms, double *vsh_ms, double *batch_ms,
+                            uint64_t *instr)
+{
+    *fetch_ms = (double)s_xf_fetch_ns / 1000000.0;
+    *vsh_ms = (double)s_xf_vsh_ns / 1000000.0;
+    *batch_ms = (double)s_xf_batch_ns / 1000000.0;
+    *instr = s_xf_instr;
+    s_xf_instr = 0;
+    s_xf_fetch_ns = s_xf_vsh_ns = s_xf_batch_ns = 0;
+}
+
 static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
 {
     float in[NV2A_VSH_INPUTS][4];
     uint32_t a;
+    uint32_t inmask;
+    uint64_t t0 = 0, t1 = 0;
+    int profile = xf_profile_wanted();
 
     if (!batch_uses_program())
         return ffp_vertex(index, out);
+    if (profile)
+        t0 = xbox_HostNowNs();
+    inmask = nv2a_vsh_input_mask();
+    /* Only the attributes the program reads: a lighting program touches four
+     * of the sixteen, and each skipped one is a guest-memory read plus a
+     * bounds check per vertex -- 160,000 vertices on a race frame. The mask is
+     * per program, so it is decoded once per upload, not per vertex. */
     for (a = 0; a < NV2A_VSH_INPUTS; a++) {
         /* An attribute with no array (size 0) reads its current value, the
          * one the SET_VERTEX_DATA* methods left -- as the hardware does --
@@ -3166,13 +3205,23 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
          * SET_VERTEX_DATA4F; reading 0,0,0,1 there sent every vertex of
          * its front end to the viewport offset. imm_attr starts at 0,0,0,1,
          * so an attribute nobody set still reads the old default. */
+        if (!(inmask & (1u << a)))
+            continue;                 /* the program never reads this one */
         if (!s_gpu.attr[a].size && a < NV_VERTEX_ATTRS)
             memcpy(in[a], s_gpu.imm_attr[a], sizeof in[a]);
         else
             fetch_attr(&s_gpu.attr[a], index, in[a]);   /* absent: 0,0,0,1 */
     }
+    if (profile)
+        t1 = xbox_HostNowNs();
     if (!nv2a_vsh_run((const float (*)[4])in, out))
         return 0;
+    if (profile) {
+        uint64_t t2 = xbox_HostNowNs();
+        s_xf_instr += nv2a_vsh_ops();
+        s_xf_fetch_ns += t1 - t0;
+        s_xf_vsh_ns += t2 - t1;
+    }
     /* oPos.w == 0 comes from a program that never divided by w: x, y and z
      * are already surface units. The hardware draws such a vertex (xemu
      * clamps w away from zero, in front of the eye), but raster_xf_clipped
@@ -3296,6 +3345,7 @@ static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count;
     static int vsh_trace_done;
+    uint64_t batch_t0 = xf_profile_wanted() ? xbox_HostNowNs() : 0;
 
     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
         return;
@@ -3535,6 +3585,8 @@ static void raster_batch_program(void)
     xf_tri_trace_finish_batch(n);
     /* The batch's triangles, all at once (see xf_queue_push). */
     xf_queue_flush();
+    if (batch_t0)
+        s_xf_batch_ns += xbox_HostNowNs() - batch_t0;   /* excludes submission */
     if (backend_draws())
         backend_flush(!s_xf_no_tex);
 }
@@ -4506,6 +4558,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* Non-zero, it is one of D3D's software methods, which the GPU traps
          * to D3D's interrupt handler on the console. Only the swap's interval
          * matters here (nv2a_flip_hold.h); the rest stays a no-op. */
+        if ((param & 0x1Fu) == 5u)
+            xbox_Nv2aQueueSoftwareMethod5();
         if (!nv2a_pb_exec_flip_pacing()) {
             if (!imm_vertex_method(method, param))
                 note_unhandled(method, param);   /* as before the hold */

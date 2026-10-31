@@ -74,17 +74,25 @@ This is a targeted rendering fix, not a claim that the full game is complete. Ot
 - Fixed the Track Select Records panels rendering white. The backend now treats NV097 format `0x06` as full-color A8R8G8B8 and reserves the alpha-only RGB override for A8 (`0x19`). The targeted build succeeded and the user verified the panels reappeared.
 - Recorded source provenance, prerequisites, game-file requirements, and third-party rights guidance in this README.
 
-### Current investigation (not yet promoted into this share snapshot)
+### Race-scene work now included (diagnostic; visual issues remain)
 
-The working tree outside this packaged snapshot has additional F12-gated traces for race-scene actor batches, combiner stages, texture/state signatures, vertex fog and alpha. These are diagnostic-only. Recent isolated tests have not established a safe fix for missing distant rider models:
+This snapshot now includes the latest build-critical D3D11/kernel sources used by the isolated Windows `RelWithDebInfo` build, including vertex-interpreter optimizations and the test-only safe-point path for NV2A software method 5. The interrupt path and renderer experiments remain diagnostic: repeated fence cycles and PMC re-enable behavior are not fully validated, and the diagnostic settings are not enabled by the normal launcher.
 
-- The corrected fog A/B matched 128 candidate draws; all had original vertex fog factor `1.0`, so forcing `1.0` had no effect.
-- The depth A/B disabled depth only for matching actor-like draws. It did not clearly restore horizon riders; it is not a confirmed fix.
-- The alpha-test A/B logged 128 matches, but the first automatic screenshot captured the Dunes loading screen rather than the race scene. Its visual effect on the missing racers is therefore inconclusive.
-- Grey ground patches have been traced to shadow-card draws arriving with blending disabled; the required blend behavior and horizontal shadow alignment remain unresolved.
-- A transient grid-pattern glitch during model/loading transitions is still under investigation.
+- The race can progress past the previously observed 0-FPS fence wait with the isolated safe-point test path, but this is not yet a production-ready or generally verified interrupt implementation.
+- A D3D11 render-target binding-cache invalidation fix is included. It compiled successfully, but the post-change capture still shows terrain/rock layering artifacts and a black/gray sky; the change is **not** claimed to fix occlusion.
+- The traced title alternates two 640x480 guest color buffers (`0x001B0000` and `0x00084000`), while the direct D3D11 route maps both to the same host backbuffer. Correct presentation and zeta/depth-buffer pairing need further investigation before changing the route.
+- Race traces show depth testing is commonly enabled with `LEQUAL` and writes enabled, and the 640x480 surface receives a depth clear. This narrows the investigation but does not prove the correct DSV is paired to every guest surface or that all transformed depth values are correct.
+- Distant rider/ATV visibility, shadow-card blending/alignment, sky rendering, and the transient model-loading grid artifact remain unresolved. Earlier fog, alpha, and actor-depth A/B tests did not establish fixes.
 
-The in-progress renderer probes and run artifacts are intentionally not represented as verified fixes in this package. Do not enable diagnostic overrides in a normal build without a reproducible visual A/B and regression check.
+Do not enable the test-only interrupt or rendering overrides in a normal build without repeat-fence testing, a controlled visual A/B, and regression checks.
+
+## Race-scene screenshots (2026-10-31)
+
+These are separate diagnostic captures from different race moments, not a controlled before/after comparison. They show current rendering progress and known remaining artifacts; they are not evidence that the depth/occlusion or sky problems are fixed.
+
+![Race scene after the D3D11 binding-cache change; terrain/rock layering and sky artifacts remain](screenshots/race-depth-occlusion-unresolved-20261031.png)
+
+![Race scene from the earlier software-method-5 event-completion test](screenshots/race-sky-and-terrain-diagnostic-20261031.png)
 
 ## Remaining development roadmap
 
@@ -97,7 +105,7 @@ The in-progress renderer probes and run artifacts are intentionally not represen
 
 ## Investigation handoff
 
-[`D3D11_HANDOFF.md`](D3D11_HANDOFF.md) carries the ongoing renderer investigation: confirmed Records-panel fix, diagnostic methods, A/B results, unresolved shadow/rider/grid issues, and recommended next steps. It is a working project handoff, not a claim of completion. Test logs, screenshots, local executable builds, and the user's game files remain excluded.
+[`D3D11_HANDOFF.md`](D3D11_HANDOFF.md) carries the ongoing renderer investigation: the confirmed Records-panel fix, safe-point method-5 test and its caveats, depth/target-routing evidence, unresolved shadow/rider/sky/grid issues, and recommended next steps. It is a working project handoff, not a claim of completion. The two selected screenshots are included for context; raw logs, local executable builds, and the user's game files remain excluded.
 
 ## Troubleshooting
 

@@ -25,6 +25,7 @@
 #include <stddef.h>   /* ptrdiff_t */
 #include <stdlib.h>
 #include <string.h>
+#include "platform/host_time.h"   /* xbox_HostNowNs, for the walk timing */
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -295,17 +296,66 @@ static void pb_consume(const uint8_t *mem, uint32_t put, uint32_t *words)
     }
 }
 
+/* Where a frame's wall time goes, part one.
+ *
+ * The D3D11 backend can time its own draw callbacks and its own Present, and
+ * on a heavy race frame both are a small fraction of the frame. The rest is
+ * either guest code or this walk: the guest writes a push pointer, the MMIO
+ * hook lands here, and every method in the stream is decoded and dispatched
+ * synchronously on the guest's thread. Without this split, "the renderer is
+ * slow" and "the title is slow" cannot be told apart from a profile.
+ *
+ * Outer entry only: a segment walk and a CALL re-enter here, and counting
+ * every level would multiply the same milliseconds. */
+uint64_t nv2a_pb_walk_ticks;
+uint32_t nv2a_pb_walk_entries;
+static int s_walk_depth;
+static int s_walk_clock_ready;
+void nv2a_pb_walk_enter(uint64_t *start_ns)
+{
+    *start_ns = 0;
+    if (s_walk_depth++)
+        return;                              /* nested: counted by the outer */
+    s_walk_clock_ready = 1;
+    *start_ns = xbox_HostNowNs();
+    nv2a_pb_walk_entries++;
+}
+void nv2a_pb_walk_leave(uint64_t start_ns)
+{
+    uint64_t end_ns;
+    if (s_walk_depth > 0)
+        s_walk_depth--;
+    if (!start_ns)
+        return;
+    end_ns = xbox_HostNowNs();
+    if (end_ns >= start_ns)
+        nv2a_pb_walk_ticks += end_ns - start_ns;
+}
+/* Milliseconds spent in the walk since the last call, in the same units the
+ * backend's frame profile uses. Resets the counter. */
+double nv2a_pb_walk_ms_take(void)
+{
+    uint64_t ns = nv2a_pb_walk_ticks;
+    nv2a_pb_walk_ticks = 0;
+    if (!s_walk_clock_ready)
+        return 0.0;
+    return (double)ns / 1000000.0;
+}
+
 void nv2a_pb_scan(uint32_t put_phys)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t put = put_phys & PB_PHYS_MASK;
     volatile uint32_t *get_reg = NULL;
     uint32_t words = 0, jumps = 0, unknown = 0;
+    uint64_t walk_start_ns;
 
     if (!pb_walk_enabled())
         return;
+    nv2a_pb_walk_enter(&walk_start_ns);
     if (s_get == 0xFFFFFFFFu) {               /* never resynced: start at PUT */
         s_get = put, s_pend_left = 0;
+        nv2a_pb_walk_leave(walk_start_ns);
         return;
     }
     if (s_exec_enabled)
@@ -425,6 +475,7 @@ void nv2a_pb_scan(uint32_t put_phys)
     s_tot_unknown += unknown;
     s_tot_jumps += jumps;
     s_tot_segments++;
+    nv2a_pb_walk_leave(walk_start_ns);
 }
 
 /* RECOMP_PB_WALK=dma selects the DMA-engine walk above. The default is the
@@ -527,17 +578,20 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
 void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
 {
     uint32_t words, jumps = 0, unknown = 0;
+    uint64_t walk_start_ns;
 
     if (!pb_walk_enabled() || end_va <= start_va)
         return;
     if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
         end_va = start_va + 0x400000u;
 
+    nv2a_pb_walk_enter(&walk_start_ns);
     if (s_exec_enabled) {
         extern void nv2a_pb_exec_walk_begin(void);
         nv2a_pb_exec_walk_begin();      /* the flip hold's vblank */
     }
     words = pb_walk_segment(start_va, end_va, 0, &jumps, &unknown);
+    nv2a_pb_walk_leave(walk_start_ns);
 
     s_tot_words += words;
     s_tot_unknown += unknown;

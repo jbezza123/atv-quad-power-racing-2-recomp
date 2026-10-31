@@ -312,6 +312,27 @@ void xbox_DispatchGateLeave(void)
         irq_release_point();
 }
 
+/* A guest thread that blocks must give the emulated CPU to device workers.
+ * Preserve recursive depth so the same thread can resume with its prior
+ * ownership after the host wait returns. */
+int xbox_DispatchGateYield(void)
+{
+    int depth;
+
+    if (!xbox_DispatchGateOn() || t_gate_depth <= 0)
+        return 0;
+    depth = t_gate_depth;
+    while (t_gate_depth > 0)
+        xbox_DispatchGateLeave();
+    return depth;
+}
+
+void xbox_DispatchGateResume(int depth)
+{
+    while (depth-- > 0)
+        xbox_DispatchGateEnter();
+}
+
 /* ============================================================================
  * Device interrupts on the gate holder
  *
@@ -350,7 +371,9 @@ static int s_dpc_on;            /* RECOMP_DPC_ON_RAISE, under the gate */
 static XBOX_THREAD_LOCAL int t_guest_thread;
 static XBOX_THREAD_LOCAL int t_in_dpc;
 static uint64_t s_irq_wait_ns;
-static const char *const s_irq_names[XBOX_IRQ_LINES] = { "vblank", "apu", "ohci" };
+static const char *const s_irq_names[XBOX_IRQ_LINES] = {
+    "vblank", "apu", "ohci", "pgraph"
+};
 
 static struct {
     volatile LONG posted[XBOX_IRQ_LINES], on_holder[XBOX_IRQ_LINES],

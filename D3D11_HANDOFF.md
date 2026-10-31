@@ -258,3 +258,28 @@ Earlier batch analysis confirmed that the solid grey patches are shadow-card dra
 6. Build and regress against the known-good Records-panel scene before promoting any candidate fix; update the share bundle and public repository only with verified milestones.
 
 Diagnostic executables, screenshots, logs and game files remain local and are not bundled. The share snapshot contains the confirmed Records-panel format fix; ongoing actor/shadow probes are in the working tree and are not represented as verified fixes in the distributable snapshot.
+
+
+## Latest continuation — method-5 safe point and race depth/occlusion (2026-10-31)
+
+### Isolated test build and method-5 behavior
+The source snapshot now includes the nine build-critical runtime files that differ from the working tree used for the successful isolated `RelWithDebInfo` build: `kernel.h`, `kernel_bridge.c`, `kernel_hal.c`, `nv2a_pb_exec.c`, `nv2a_pb_scan.c`, `nv2a_vsh_interp.c`, `nv2a_vsh_interp.h`, `xbox_memory_layout.c`, and `nv2a_backend_d3d11.c`. The current working-source copies were SHA-256 verified after synchronization. No game executable, XBE, archive, media, or other recipient-supplied game files were copied.
+
+The current working build contains an opt-in PGRAPH vector-3 safe-point test path for software method 5, routed through the initialized timer-thread guest context. A prior test reached the guest ISR with claimed PGRAPH status and then kept presenting at approximately 8–9 FPS for a sustained interval. Caveats remain: the first interrupt precedes capture of the title event, the relationship between the ISR/DPC and the first fence completion is not conclusive, PMC hardware enable later reads zero, and distinct fence cycles with reset events/re-enabled interrupt have not been validated. Keep the test switch and title event compatibility diagnostic-only; do not enable them in the normal launcher or describe the IRQ path as production-ready.
+
+### D3D11 binding-cache correction and unresolved visual artifact
+In `xboxrecomp-main/src/nv2a/nv2a_backend_d3d11.c`, binding-cache state is now invalidated after render-target unbinds during target recreation, offscreen-cache eviction, and guest-surface switches. This ensures a subsequent draw cannot skip RTV/DSV rebinding based on stale pointer comparisons. The isolated build succeeded with this change, but the post-change race screenshot still shows a black/gray sky and incorrect-looking terrain/rock layering. It is not a verified fix for the user's report that track objects above a jump remain visible while viewed from below.
+
+A one-frame pushbuffer trace captured 862 race batches: 755 with depth enabled, compare `LEQUAL` (`0x203`) and depth writes enabled; 90 with `LEQUAL` and writes disabled; and 17 with `ALWAYS` (`0x207`) and writes disabled. Guest Z24 values are normalized before D3D11 submission; the HLSL vertex shader emits `z*w` with clip `w`, so the rasterizer's divide should preserve that depth. The 640x480 guest surface receives depth clears (`0x3`/`0xF3`, guest value `0xFFFFFF00`, host clear 1.0). This makes a globally disabled depth test less likely, but does not prove correct Z-target association or transformed values.
+
+### Guest-buffer and host-presentation lead
+The trace shows a flip presenting guest color buffer `0x001B0000`, then the next frame begins using `0x00084000`; these are alternating 640x480 buffers. The direct backend routes both equal-size surfaces to the same host backbuffer based on dimensions. The pushbuffer executor tracks `drawn_offset`, but the D3D11 `flip(void)` callback is not passed the completed guest surface address. This is a significant presentation/target-aliasing lead, not a proven root cause. Trace guest flip/write/read state and the zeta target before changing which buffer maps to the host backbuffer.
+
+### Screenshots and test artifacts
+Two race screenshots are included under `screenshots/`: `race-depth-occlusion-unresolved-20261031.png` (post-cache-change capture) and `race-sky-and-terrain-diagnostic-20261031.png` (earlier method-5 event-test capture). They show separate race moments, not a controlled A/B comparison. Full logs and launchers remain in the user's working directory under `my_xbox_game/.work/bench/`; they are not part of this public package. The tracing build's race FPS was heavily affected by tracing and is not a normal-play benchmark.
+
+### Next steps
+1. Run the package's `install_build.ps1` against the updated bundled source and confirm a clean build without game assets.
+2. Continue the race depth/occlusion investigation by instrumenting the guest read/write flip buffers, current color/zeta offsets, render-target binding, and actual DSV selection; do not force depth state or choose a guest buffer by address without evidence.
+3. Re-test more than one method-5 fence cycle with the event reset between waits and interrupt re-enabled after guest ACK; only then decide whether to promote the interrupt path.
+4. Resolve the black sky, distant rider visibility, and shadow artifacts with low-overhead scene-matched captures. Keep `my_xbox_game1.exe` and `play_game.bat` unchanged until the user validates a fix.
