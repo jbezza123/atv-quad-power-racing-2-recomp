@@ -1,0 +1,35 @@
+{
+  "$schema": "https://recomp.fyi/schema/v1.json",
+  "game": "ATV Quad Power Racing 2",
+  "wikidata": "Q4654942",
+  "system": "Xbox",
+  "type": "recomp",
+  "original": {
+    "region": "Europe"
+  },
+  "project": "ATV Quad Power Racing 2 Recompiled",
+  "status": "in-progress",
+  "targets": [
+    "Windows"
+  ],
+  "toolchain": "Custom",
+  "approach": "Static recompilation with external asset loading overrides",
+  "maintainers": [
+    {
+      "name": "jbezza123",
+      "link": "https://github.com/jbezza123"
+    }
+  ],
+  "links": [
+    {
+      "label": "GitHub",
+      "url": "https://github.com/jbezza123/atv-quad-power-racing-2-recomp"
+    }
+  ],
+  "help": [
+    "Archive extraction (.BAH/.BAD file formats)",
+    "Directory structure mapping for loose external assets",
+    "Graphics rendering (depth buffering/Z-sorting and transparency draw order)"
+  ],
+  "notes": "Static recompilation of ATV Quad Power Racing 2 (Xbox PAL) targeting native Windows execution with support for loose file overrides."
+}
