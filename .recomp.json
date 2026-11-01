@@ -13,7 +13,7 @@
     "Windows"
   ],
   "toolchain": "Custom",
-  "approach": "Static recompilation with external asset loading overrides",
+  "approach": "Static recompilation",
   "maintainers": [
     {
       "name": "jbezza123",
