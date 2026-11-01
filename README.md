@@ -122,3 +122,17 @@ The generated recompilation sources are included because this CMake target compi
 ## Project intent
 
 The parent project goal is a working native decompilation/recompilation of ATV Quad Power Racing 2 using `xboxrecomp`. The current snapshot is an intermediate Windows D3D11 backend diagnostic build, not a release build or a finished game port.
+
+
+## Current race-scene status (2026-11-01)
+
+The captured 512×512 surface `0x82809000` is the Dunes Lagoon **loading card**, not the live race sky. See [the captured loading target](screenshots/loading-target-82809000-20261101.png). A separate race frame shows the gray sky and white square sun; another 3250-draw test frame shows black sky and incomplete background geometry. These are different moments, not a controlled A/B: [gray sky / white square](screenshots/race-gray-sky-white-square-20261101.png), [3250-draw race frame](screenshots/race-max-draws-3250-20261101.png).
+
+`RECOMP_D3D_MAX_DRAWS=3250` was tested only in an isolated diagnostic run. Its reported race intervals were 6.40, 5.16 and 6.50 FPS, with about 751 draws/frame—below the configured cap. This does not establish a performance benefit or validate the user's “sweet spot” impression; the value is not applied to the normal launcher. Frame dumping and the method-5 test path also make this unsuitable as a clean benchmark.
+
+The package source now includes format-aware guest Z16/Z24S8 depth/stencil clears and opt-in target/zeta diagnostics. It builds without bundled game assets; these changes are **not** claimed to fix terrain occlusion, sky, or distant-rider visibility. The unverified signed reciprocal-W shader experiment is intentionally excluded. The scoped handoff records exact evidence and next steps in [`D3D11_HANDOFF.md`](D3D11_HANDOFF.md). The repository still omits game binaries, assets, local executables, and build outputs.
+
+
+## Build validation (2026-11-01)
+
+The repository's `install_build.ps1` completed successfully for `RelWithDebInfo` without any game assets, using an external build directory under the local `.work` area. The first package attempt exposed a missing `Nv2aRenderState.zeta_format` declaration; after syncing the matching backend header, the build succeeded. MSVC still reports existing warnings, but no compile errors. The resulting executable and all build files are intentionally excluded from this repository.

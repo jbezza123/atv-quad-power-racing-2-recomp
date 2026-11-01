@@ -283,3 +283,17 @@ Two race screenshots are included under `screenshots/`: `race-depth-occlusion-un
 2. Continue the race depth/occlusion investigation by instrumenting the guest read/write flip buffers, current color/zeta offsets, render-target binding, and actual DSV selection; do not force depth state or choose a guest buffer by address without evidence.
 3. Re-test more than one method-5 fence cycle with the event reset between waits and interrupt re-enabled after guest ACK; only then decide whether to promote the interrupt path.
 4. Resolve the black sky, distant rider visibility, and shadow artifacts with low-overhead scene-matched captures. Keep `my_xbox_game1.exe` and `play_game.bat` unchanged until the user validates a fix.
+
+
+## Latest continuation — live-race sky target correction and 3250-draw test (2026-11-01)
+
+- The `512x512` guest surface `0x82809000` is now identified from its captured pixels as the Dunes Lagoon loading card, not the live race skybox. The bundled image `screenshots/loading-target-82809000-20261101.png` proves this. Its producer/consumer trace belongs to loading composition and must not be used to identify the live sky pass.
+- A separate race capture reproduces the user's gray sky and white square sun (`screenshots/race-gray-sky-white-square-20261101.png`). The isolated `RECOMP_D3D_MAX_DRAWS=3250` run reached live racing; its screenshot (`screenshots/race-max-draws-3250-20261101.png`) shows black sky and incomplete background/track geometry at a different race moment. These are not a matched A/B and no sky or occlusion fix is demonstrated.
+- The 3250 run reported 6.40, 5.16 and 6.50 FPS intervals and about 751 D3D draws/frame, below the 3250 limit. The cap was not shown to bind; this frame-dumping/method-5 diagnostic is not a benchmark. The user-reported “sweet spot” remains unverified. The value is not adopted as a normal-launcher default.
+- The updated package source carries the format-aware guest Z16/Z24S8 depth/stencil clear path and bounded zeta/sky diagnostics. These compile-check as part of this snapshot but are not claimed to fix the mountain/hill occlusion, gray/black sky, distant rider visibility, or race stability. The experimental signed reciprocal-W shader change was intentionally excluded pending a matched one-variable test and evidence that negative `rhw` reaches D3D11.
+- A bounded wide-draw trace gated at frame 6000 produced no candidate rows; its gate/filter remains uncalibrated. Do not infer that the race has no wide/background batches. Next: trace actual live-race sky/material draws with a race-specific trigger and continue guest zeta/host DSV identity investigation. Repeated method-5 semaphore/IRQ cycles also remain unvalidated.
+
+
+## Package build validation — 2026-11-01
+
+The scoped package was built with its own `install_build.ps1` in `RelWithDebInfo`, using an external local output directory (`my_xbox_game/.work/build_share_snapshot_20261101`). The first attempt exposed that the updated clear path and executor expected `Nv2aRenderState.zeta_format`, while the bundled `nv2a_backend.h` did not yet declare it. The matching header field was synced, and the second build completed successfully without game assets. It still emits existing MSVC warnings (including signed/unsigned comparisons and legacy parameter-shadowing warnings); it has no compile errors. The executable and build output remain local and are not added to this repository. This completes the build-validation item listed in the preceding “Next steps”; race rendering and synchronization remain unresolved.

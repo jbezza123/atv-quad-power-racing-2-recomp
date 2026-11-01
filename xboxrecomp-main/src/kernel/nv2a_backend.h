@@ -74,8 +74,9 @@ typedef struct {
     uint32_t color_mask;
     uint32_t cull_enable, cull_face, front_face;
     uint32_t zeta_va;                                    /* 0: no depth surface */
+    uint32_t zeta_format;                                /* 1: Z16, 2: Z24S8 */
     float    depth_min, depth_max;                       /* SET_CLIP_MIN/MAX */
-    /* SET_STENCIL_*: compare function as above; ops GL_KEEP 0x1E00, GL_ZERO 0,
+    /* SET_STENCIL_*: compare function as above, ops GL_KEEP 0x1E00, GL_ZERO 0,
      * GL_REPLACE 0x1E01, GL_INCR 0x1E02, GL_DECR 0x1E03, GL_INVERT 0x150A,
      * GL_INCR_WRAP 0x8507, GL_DECR_WRAP 0x8508. Reset values GL_ALWAYS, masks
      * 0xFF, GL_KEEP. A title can confine a pass to the pixels an earlier pass
