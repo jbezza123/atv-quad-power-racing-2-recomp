@@ -378,7 +378,25 @@ static float reg_f(uint32_t method)
 
 /* Where BACK_END_WRITE_SEMAPHORE_RELEASE lands; see nv2a_backend.h. */
 static uint32_t s_sem_va;
-void nv2a_pb_set_semaphore_target(uint32_t guest_va) { s_sem_va = guest_va; }
+static int s_sem_trace = -1;
+static unsigned s_sem_trace_count;
+static int nv2a_pb_sem_trace_enabled(void)
+{
+    const char *e;
+    if (s_sem_trace < 0) {
+        e = getenv("RECOMP_NV2A_SEM_TRACE");
+        s_sem_trace = e && e[0] && e[0] != '0';
+    }
+    return s_sem_trace;
+}
+void nv2a_pb_set_semaphore_target(uint32_t guest_va)
+{
+    s_sem_va = guest_va;
+    if (nv2a_pb_sem_trace_enabled() && s_sem_trace_count < 64) {
+        fprintf(stderr, "[PB-SEM] target=%08X\n", guest_va);
+        s_sem_trace_count++;
+    }
+}
 
 /* Unhandled methods, ranked. The interesting output is not that something was
  * skipped but which things dominate, because that is the order to implement
@@ -819,6 +837,7 @@ static void current_render_state(Nv2aRenderState *r)
     r->cull_face         = s_reg[0x039C / 4];        /* SET_CULL_FACE */
     r->front_face        = s_reg[0x03A0 / 4];        /* SET_FRONT_FACE */
     r->zeta_va           = s_gpu.zeta_offset ? dma_resolve(s_gpu.zeta_offset) : 0;
+    r->zeta_format       = (s_gpu.format >> 4) & 0xF;
     r->depth_min         = reg_f(0x0394);            /* SET_CLIP_MIN */
     r->depth_max         = reg_f(0x0398);            /* SET_CLIP_MAX */
     r->stencil_enable    = s_reg[0x032C / 4];        /* SET_STENCIL_TEST_ENABLE */
@@ -3768,7 +3787,8 @@ static void draw_primitive(void)
         if (s_ftrace == 2) {
             fprintf(stderr, "[FTRACE] %s prim %u n %u surf %08X %ux%u+%u+%u"
                     " pitch %u | tex %s %08X %ux%u fmt %02X | blend %u %X/%X"
-                    " eq %X | z test %u func %X mask %u | tris %u px %llu\n",
+                    " eq %X | zeta off %08X va %08X | z test %u func %X mask %u"
+                    " | tris %u px %llu\n",
                     (s_gpu.xf_mode & 3) == 2 ? "PRG" : "FIX", s_gpu.prim,
                     s_gpu.idx_count, s_gpu.color_offset, s_gpu.clip_w,
                     s_gpu.clip_h, s_gpu.clip_x, s_gpu.clip_y, s_gpu.pitch,
@@ -3776,6 +3796,8 @@ static void draw_primitive(void)
                     s_gpu.texs[0].width, s_gpu.texs[0].height, s_gpu.texs[0].color,
                     s_gpu.blend_enable, s_gpu.blend_sfactor,
                     s_gpu.blend_dfactor, s_gpu.blend_equation,
+                    s_gpu.zeta_offset,
+                    s_gpu.zeta_offset ? dma_resolve(s_gpu.zeta_offset) : 0,
                     s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
                     s_gpu.tris_drawn - t0,
                     (unsigned long long)(s_gpu.pixels - p0));
@@ -4280,10 +4302,18 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     /* BACK_END_WRITE_SEMAPHORE_RELEASE. The title's pointer already names the
      * semaphore word; SET_SEMAPHORE_OFFSET is not added (in X-Men Legends it
      * held 0xFF000000 at times, which put the write outside guest memory). */
-    if (subch == 0 && method == 0x1D70 && s_sem_va) {
-        uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
-        *(volatile uint32_t *)(mem + s_sem_va) = param;
-        return;
+    if (subch == 0 && method == 0x1D70) {
+        if (nv2a_pb_sem_trace_enabled() && s_ftrace == 2 &&
+            s_sem_trace_count < 64) {
+            fprintf(stderr, "[PB-SEM] release value=%08X target=%08X mirror_va=%08X\n",
+                    param, s_sem_va, xbox_Nv2aFenceWordVa());
+            s_sem_trace_count++;
+        }
+        if (s_sem_va) {
+            uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+            *(volatile uint32_t *)(mem + s_sem_va) = param;
+            return;
+        }
     }
     if (!inited) {
         inited = 1;
@@ -4485,9 +4515,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
     case NV097_CLEAR_SURFACE:
         if (s_ftrace == 2)
-            fprintf(stderr, "[FTRACE] clear %X surf %08X %ux%u colour %08X%c",
+            fprintf(stderr, "[FTRACE] clear %X surf %08X %ux%u colour %08X"
+                    " zeta_off %08X zeta_va %08X zstencil %08X%c",
                     param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
-                    s_gpu.clear_color, 10);
+                    s_gpu.clear_color, s_gpu.zeta_offset,
+                    s_gpu.zeta_offset ? dma_resolve(s_gpu.zeta_offset) : 0,
+                    s_gpu.zstencil_clear, 10);
         clear_surface(param);
         if (param & 0x01)                         /* Z */
             zbuf_clear();

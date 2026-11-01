@@ -418,7 +418,7 @@ static const char s_hlsl[] =
                  " float4 tc2 : TEXCOORD2; float4 tc3 : TEXCOORD3; float fog : TEXCOORD5; };\n"
     "struct VSOut { float4 pos : SV_Position; float4 color0 : COLOR0; float4 color1 : COLOR1;"
                    " float3 tc0 : TEXCOORD0; float3 tc1 : TEXCOORD1;"
-                   " float3 tc2 : TEXCOORD2; float3 tc3 : TEXCOORD3; float fog : TEXCOORD5; };\n"
+    " float3 tc2 : TEXCOORD2; float3 tc3 : TEXCOORD3; float fog : TEXCOORD5; };\n"
     "VSOut vs(VSIn i) { VSOut o; float2 p = i.pos.xy;"
     " float w = i.rhw > 1.0e-20 ? rcp(i.rhw) : 1.0;"
     " float2 ndc = float2(p.x / size.x * 2.0 - 1.0,"
@@ -1107,6 +1107,7 @@ static int record_rt_index(uint32_t color_va)
     case 0x82761000: return 3;
     case 0x827C1000: return 4;
     case 0x827A1000: return 5;
+    case 0x82809000: return 6;
     default: return -1;
     }
 }
@@ -1130,7 +1131,7 @@ static void dump_record_rt_once(uint32_t slot,
         !s_dev || !s_ctx)
         return;
     index = record_rt_index(entry->color_va);
-    if (index < 0 || index >= 6)
+    if (index < 0 || index >= 7)
         return;
     bit = 1u << (uint32_t)index;
     if (s_record_rt_dump_mask & bit)
@@ -1744,23 +1745,43 @@ static void d3d11_clear(const Nv2aSurface *surface, const Nv2aRenderState *state
     static unsigned trace_count;
     static int depth_trace = -1;
     static unsigned depth_trace_count;
-    static float depth_clear_value = -1.0f;
+    static int depth_clear_override = -1;
+    static float depth_clear_override_value = 1.0f;
+    static unsigned sky_target_clear_trace_count;
     const char *trace_env;
     float c[4];
-    if (depth_clear_value < 0.0f) {
+    float depth_clear_value;
+    uint32_t stencil_clear_value = 0;
+    if (depth_clear_override < 0) {
         const char *e = getenv("RECOMP_D3D_DEPTH_CLEAR");
-        depth_clear_value = e && *e ? (float)atof(e) : 1.0f;
-        if (depth_clear_value < 0.0f) depth_clear_value = 0.0f;
-        if (depth_clear_value > 1.0f) depth_clear_value = 1.0f;
+        if (e && *e) {
+            depth_clear_override_value = (float)atof(e);
+            if (depth_clear_override_value < 0.0f) depth_clear_override_value = 0.0f;
+            if (depth_clear_override_value > 1.0f) depth_clear_override_value = 1.0f;
+            depth_clear_override = 1;
+        } else {
+            depth_clear_override = 0;
+        }
+    }
+    if (depth_clear_override) {
+        depth_clear_value = depth_clear_override_value;
+    } else if (state && state->zeta_format == 1) {
+        depth_clear_value = (float)(zstencil & 0xFFFFu) / 65535.0f;
+    } else if (state && state->zeta_format == 2) {
+        depth_clear_value = (float)((zstencil >> 8) & 0x00FFFFFFu) / 16777215.0f;
+        stencil_clear_value = zstencil & 0xFFu;
+    } else {
+        depth_clear_value = 1.0f;
     }
     if (depth_trace < 0) {
         trace_env = getenv("RECOMP_D3D_DEPTH_TRACE");
         depth_trace = trace_env && trace_env[0] && trace_env[0] != '0';
     }
-    if (depth_trace && (flags & 1) && depth_trace_count < 12) {
-        fprintf(stderr, "[D3D11-DEPTH-CLEAR] target=0x%08X %ux%u flags=0x%X guest_z=0x%08X clear=%.3f test=%u func=0x%X write=%u\n",
+    if (depth_trace && (flags & 1) && depth_trace_count < 64) {
+        fprintf(stderr, "[D3D11-DEPTH-CLEAR] target=0x%08X %ux%u flags=0x%X zeta=0x%08X format=%u guest_z=0x%08X clear=%.6f stencil=%u test=%u func=0x%X write=%u\n",
                 surface->color_va, surface->width, surface->height, flags,
-                zstencil, depth_clear_value,
+                state ? state->zeta_va : 0, state ? state->zeta_format : 0,
+                zstencil, depth_clear_value, stencil_clear_value,
                 state ? state->depth_test_enable : 0,
                 state ? state->depth_func : 0,
                 state ? state->depth_write : 0);
@@ -1782,6 +1803,16 @@ static void d3d11_clear(const Nv2aSurface *surface, const Nv2aRenderState *state
     if (!init_gpu_objects()) return;
     if (!select_direct_surface(surface)) return;
     if (!create_target(surface->width, surface->height)) return;
+    if (sky_texture_trace_enabled() && surface->color_va == 0x82809000 &&
+        sky_target_clear_trace_count < 32u) {
+        fprintf(stderr,
+            "[D3D11-SKY-TARGET-CLEAR] n=%u frame=%u draw=%u target=0x%08X size=%ux%u pitch=%u flags=0x%X argb=0x%08X zeta=0x%08X zfmt=%u zstencil=0x%08X rtv=%p dsv=%p\n",
+            ++sky_target_clear_trace_count, s_frame_count + 1, s_draw_count,
+            surface->color_va, surface->width, surface->height, surface->pitch,
+            flags, argb, state ? state->zeta_va : 0,
+            state ? state->zeta_format : 0, zstencil, (void *)s_rtv,
+            (void *)s_dsv);
+    }
     c[0] = ((argb >> 16) & 255) / 255.0f;
     c[1] = ((argb >> 8) & 255) / 255.0f;
     c[2] = (argb & 255) / 255.0f;
@@ -1789,7 +1820,8 @@ static void d3d11_clear(const Nv2aSurface *surface, const Nv2aRenderState *state
     if (flags & 0xF0) ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_rtv, c);
     if ((flags & 3) && s_dsv)
         ID3D11DeviceContext_ClearDepthStencilView(s_ctx, s_dsv,
-            (flags & 1 ? D3D11_CLEAR_DEPTH : 0) | (flags & 2 ? D3D11_CLEAR_STENCIL : 0), depth_clear_value, 0);
+            (flags & 1 ? D3D11_CLEAR_DEPTH : 0) | (flags & 2 ? D3D11_CLEAR_STENCIL : 0),
+            depth_clear_value, stencil_clear_value);
 }
 
 static void d3d11_decode_input(uint32_t byte, NV2ACombinerInput *out)
@@ -2122,13 +2154,124 @@ static void d3d11_draw_impl(const Nv2aSurface *surface, const Nv2aBatch *batch)
     if (s_perf_trace) perf_stage_record(1, &perf_stage_last);
     textured = srvs[0] != NULL;
     {
+        static int trace_after = -1;
+        static unsigned trace_count;
+        if (trace_after < 0) {
+            const char *trace_env = getenv("RECOMP_D3D_RACE_DRAW_TRACE_AFTER");
+            trace_after = trace_env && trace_env[0] ? atoi(trace_env) : 0;
+        }
+        if (trace_after > 0 && s_frame_count + 1u >= (uint32_t)trace_after &&
+            surface->width == 640 && surface->height == 480 &&
+            batch->count >= 3 && batch->count <= 8192 && trace_count < 64u) {
+            const Nv2aVertex *v = &batch->vertices[0];
+            const Nv2aCombiner *c = batch->combiner;
+            uint32_t vi;
+            float min_x = v->x, max_x = v->x;
+            float min_y = v->y, max_y = v->y;
+            float min_z = v->z, max_z = v->z;
+            float min_rhw = v->rhw, max_rhw = v->rhw;
+            for (vi = 1; vi < batch->count; vi++) {
+                const Nv2aVertex *bv = &batch->vertices[vi];
+                if (bv->x < min_x) min_x = bv->x;
+                if (bv->x > max_x) max_x = bv->x;
+                if (bv->y < min_y) min_y = bv->y;
+                if (bv->y > max_y) max_y = bv->y;
+                if (bv->z < min_z) min_z = bv->z;
+                if (bv->z > max_z) max_z = bv->z;
+                if (bv->rhw < min_rhw) min_rhw = bv->rhw;
+                if (bv->rhw > max_rhw) max_rhw = bv->rhw;
+            }
+            if (max_x - min_x >= (float)surface->width * 0.50f &&
+                max_y - min_y >= (float)surface->height * 0.10f) {
+                const Nv2aTexture *t0 = tex_stage[0];
+                const Nv2aTexture *t1 = tex_stage[1];
+                fprintf(stderr,
+                    "[D3D11-RACE-LARGE-DRAW] n=%u frame=%u draw=%u target=0x%08X verts=%u bounds=(x=%.2f..%.2f,y=%.2f..%.2f,z=%.6g..%.6g,rhw=%.6g..%.6g) tex0=0x%08X/%ux%u/fmt%02X tex1=0x%08X/%ux%u/fmt%02X comb=0x%08X/%08X rgb0=%08X alpha0=%08X rgbout0=%08X alphaout0=%08X final=%08X/%08X blend=%u depth=%u func=0x%X write=%u zeta=0x%08X zfmt=%u rtv=%p dsv=%p\n",
+                    ++trace_count, s_frame_count + 1u, s_draw_count,
+                    surface->color_va, batch->count,
+                    min_x, max_x, min_y, max_y, min_z, max_z,
+                    min_rhw, max_rhw,
+                    t0 ? t0->offset : 0, t0 ? t0->width : 0,
+                    t0 ? t0->height : 0, t0 ? (t0->color & 0xFF) : 0,
+                    t1 ? t1->offset : 0, t1 ? t1->width : 0,
+                    t1 ? t1->height : 0, t1 ? (t1->color & 0xFF) : 0,
+                    c ? c->control : 0, c ? c->stage_program : 0,
+                    c ? c->color_icw[0] : 0, c ? c->alpha_icw[0] : 0,
+                    c ? c->color_ocw[0] : 0, c ? c->alpha_ocw[0] : 0,
+                    c ? c->final0 : 0, c ? c->final1 : 0,
+                    batch->state ? batch->state->blend_enable : 0,
+                    batch->state ? batch->state->depth_test_enable : 0,
+                    batch->state ? batch->state->depth_func : 0,
+                    batch->state ? batch->state->depth_write : 0,
+                    batch->state ? batch->state->zeta_va : 0,
+                    batch->state ? batch->state->zeta_format : 0,
+                    (void *)s_rtv, (void *)s_dsv);
+            }
+        }
+    }
+    {
+        static unsigned sky_target_draw_trace_count;
+        if (sky_texture_trace_enabled() &&
+            surface->color_va == 0x82809000 &&
+            sky_target_draw_trace_count < 64u) {
+            const Nv2aVertex *sv = &batch->vertices[0];
+            const Nv2aCombiner *sc = batch->combiner;
+            uint32_t vi;
+            float min_x = sv->x, max_x = sv->x;
+            float min_y = sv->y, max_y = sv->y;
+            float min_z = sv->z, max_z = sv->z;
+            for (vi = 1; vi < batch->count; vi++) {
+                const Nv2aVertex *bv = &batch->vertices[vi];
+                if (bv->x < min_x) min_x = bv->x;
+                if (bv->x > max_x) max_x = bv->x;
+                if (bv->y < min_y) min_y = bv->y;
+                if (bv->y > max_y) max_y = bv->y;
+                if (bv->z < min_z) min_z = bv->z;
+                if (bv->z > max_z) max_z = bv->z;
+            }
+            fprintf(stderr,
+                "[D3D11-SKY-TARGET-DRAW] n=%u frame=%u draw=%u target=0x%08X size=%ux%u verts=%u tex0=0x%08X/fmt%02X tex1=0x%08X/fmt%02X combiner=%08X/%08X depth=%u func=0x%X write=%u zeta=0x%08X zfmt=%u rtv=%p dsv=%p first=(%.2f,%.2f,z=%.6g,rhw=%.6g) bounds=(x=%.2f..%.2f,y=%.2f..%.2f,z=%.6g..%.6g)\n",
+                ++sky_target_draw_trace_count, s_frame_count + 1, s_draw_count,
+                surface->color_va, surface->width, surface->height, batch->count,
+                tex_stage[0] ? tex_stage[0]->offset : 0,
+                tex_stage[0] ? (tex_stage[0]->color & 0xFF) : 0,
+                tex_stage[1] ? tex_stage[1]->offset : 0,
+                tex_stage[1] ? (tex_stage[1]->color & 0xFF) : 0,
+                sc ? sc->control : 0, sc ? sc->stage_program : 0,
+                batch->state ? batch->state->depth_test_enable : 0,
+                batch->state ? batch->state->depth_func : 0,
+                batch->state ? batch->state->depth_write : 0,
+                batch->state ? batch->state->zeta_va : 0,
+                batch->state ? batch->state->zeta_format : 0,
+                (void *)s_rtv, (void *)s_dsv, sv->x, sv->y, sv->z, sv->rhw,
+                min_x, max_x, min_y, max_y, min_z, max_z);
+        }
+    }
+    {
         static unsigned sky_trace_count;
         if (sky_texture_trace_enabled() && sky_trace_count < 64 && tex_stage[0] &&
             tex_stage[0]->offset == 0x82809000) {
             const Nv2aCombiner *c = batch->combiner;
             const Nv2aVertex *v = &batch->vertices[0];
-            fprintf(stderr, "[D3D11-SKY-DRAW] n=%u frame=%u target=%ux%u surface=0x%08X verts=%u tex=%ux%u fmt=0x%02X combiner=%p ctrl=%08X prog=%08X rgb0=%08X alpha0=%08X rgbout0=%08X alphaout0=%08X final=%08X/%08X alpha_test=%u func=0x%X ref=%u blend=%u depth=%u cull=%u first_xy=(%.2f,%.2f) uv=(%.5f,%.5f,%.5f) color=%08X\n",
-                    ++sky_trace_count, s_frame_count + 1, surface->width,
+            uint32_t vi;
+            float min_x = v->x, max_x = v->x;
+            float min_y = v->y, max_y = v->y;
+            float min_z = v->z, max_z = v->z;
+            float min_rhw = v->rhw, max_rhw = v->rhw;
+            for (vi = 1; vi < batch->count; vi++) {
+                const Nv2aVertex *bv = &batch->vertices[vi];
+                if (bv->x < min_x) min_x = bv->x;
+                if (bv->x > max_x) max_x = bv->x;
+                if (bv->y < min_y) min_y = bv->y;
+                if (bv->y > max_y) max_y = bv->y;
+                if (bv->z < min_z) min_z = bv->z;
+                if (bv->z > max_z) max_z = bv->z;
+                if (bv->rhw < min_rhw) min_rhw = bv->rhw;
+                if (bv->rhw > max_rhw) max_rhw = bv->rhw;
+            }
+            fprintf(stderr, "[D3D11-SKY-DRAW] n=%u frame=%u draw=%u target=%ux%u surface=0x%08X verts=%u tex=%ux%u fmt=0x%02X combiner=%p ctrl=%08X prog=%08X rgb0=%08X alpha0=%08X rgbout0=%08X alphaout0=%08X final=%08X/%08X alpha_test=%u func=0x%X ref=%u blend=%u depth=%u depthfunc=0x%X zwrite=%u zeta=0x%08X zfmt=%u cull=%u first=(%.2f,%.2f,z=%.6g,rhw=%.6g) bounds=(x=%.2f..%.2f,y=%.2f..%.2f,z=%.6g..%.6g,rhw=%.6g..%.6g) uv=(%.5f,%.5f,%.5f) color=%08X\n",
+                    ++sky_trace_count, s_frame_count + 1, s_draw_count,
+                    surface->width,
                     surface->height, surface->color_va, batch->count,
                     tex_stage[0]->width, tex_stage[0]->height,
                     tex_stage[0]->color & 0xFF, (const void *)c,
@@ -2141,8 +2284,14 @@ static void d3d11_draw_impl(const Nv2aSurface *surface, const Nv2aBatch *batch)
                     batch->state ? batch->state->alpha_ref : 0,
                     batch->state ? batch->state->blend_enable : 0,
                     batch->state ? batch->state->depth_test_enable : 0,
+                    batch->state ? batch->state->depth_func : 0,
+                    batch->state ? batch->state->depth_write : 0,
+                    batch->state ? batch->state->zeta_va : 0,
+                    batch->state ? batch->state->zeta_format : 0,
                     batch->state ? batch->state->cull_enable : 0,
-                    v->x, v->y, v->tex[0][0], v->tex[0][1], v->tex[0][3],
+                    v->x, v->y, v->z, v->rhw,
+                    min_x, max_x, min_y, max_y, min_z, max_z, min_rhw, max_rhw,
+                    v->tex[0][0], v->tex[0][1], v->tex[0][3],
                     v->diffuse);
         }
     }
@@ -2390,6 +2539,35 @@ static void d3d11_draw_impl(const Nv2aSurface *surface, const Nv2aBatch *batch)
         s_bound_dsv = s_dsv;
     }
     render_state = batch->state;
+    {
+        static int clip_range_trace = -1;
+        static int clip_range_last_valid;
+        static uint32_t clip_range_last_min, clip_range_last_max;
+        static uint32_t clip_range_trace_count;
+        const char *trace_env;
+        if (clip_range_trace < 0) {
+            trace_env = getenv("RECOMP_D3D_CLIP_RANGE_TRACE");
+            clip_range_trace = trace_env && trace_env[0] && trace_env[0] != '0';
+        }
+        if (clip_range_trace && batch->state && clip_range_trace_count < 64u) {
+            union { float f; uint32_t u; } min_bits, max_bits;
+            min_bits.f = batch->state->depth_min;
+            max_bits.f = batch->state->depth_max;
+            if (!clip_range_last_valid || min_bits.u != clip_range_last_min ||
+                max_bits.u != clip_range_last_max) {
+                fprintf(stderr, "[D3D11-CLIP-RANGE] target=0x%08X %ux%u zeta=0x%08X depth=%u func=0x%X write=%u min=%.9g max=%.9g bits=%08X/%08X\n",
+                        surface->color_va, surface->width, surface->height,
+                        batch->state->zeta_va, batch->state->depth_test_enable,
+                        batch->state->depth_func, batch->state->depth_write,
+                        batch->state->depth_min, batch->state->depth_max,
+                        min_bits.u, max_bits.u);
+                clip_range_last_min = min_bits.u;
+                clip_range_last_max = max_bits.u;
+                clip_range_last_valid = 1;
+                clip_range_trace_count++;
+            }
+        }
+    }
     shadow_tex0 = batch->textures[0] ? batch->textures[0] : batch->texture;
     shadow_tex1 = batch->textures[1];
     /* Match stable texture/state metadata; guest texture VAs can move per run. */
