@@ -46,6 +46,7 @@ typedef struct {
     uint32_t width, height;
     uint32_t pitch;             /* linear formats only */
     uint32_t color;             /* NV097 colour-format code */
+    uint32_t palette;           /* guest address of the CLUT for indexed formats */
     uint32_t addr_u, addr_v;    /* NV097 wrap mode per axis (1 wrap, 3 clamp) */
     /* Mip levels stored after level 0 (the format word's MIPMAP_LEVELS; 1 for
      * a linear texture) and the raw SET_TEXTURE_FILTER word (MIN in bits

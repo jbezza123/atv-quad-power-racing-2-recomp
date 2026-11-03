@@ -1,0 +1,1 @@
+Place the finished desktop shortcut icon here as a Windows `.ico` file. After a successful build, the wizard asks whether to create a shortcut and uses the first `.ico` file in this folder. If no icon is present, it uses the built executable's default icon.

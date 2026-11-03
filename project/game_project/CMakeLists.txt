@@ -29,7 +29,7 @@ add_compile_definitions(
 # Option B: find_package (if you install xboxrecomp system-wide)
 #   find_package(xboxrecomp REQUIRED)
 #
-# Default to the sibling toolkit bundled with this share package:
+# Adjust this path to point to your xboxrecomp clone:
 set(XBOXRECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../xboxrecomp-main" CACHE PATH
     "Path to the xboxrecomp toolkit root directory")
 

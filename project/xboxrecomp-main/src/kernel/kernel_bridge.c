@@ -2166,6 +2166,8 @@ static void bridge_KeWaitForSingleObject(void)
     HANDLE h;
     LONG trace_n = 0;
     int trace = kernel_wait_trace_on();
+    uint32_t trace_hdr = 0, trace_state = 0;
+    int trace_guest_words = 0;
 
     if (g_xbox_kernel_caller == 0x00196E0Bu)
         InterlockedExchange(&s_wait_trace_object, (LONG)object);
@@ -2233,10 +2235,19 @@ static void bridge_KeWaitForSingleObject(void)
             path = h ? "native" : "null";
         }
         if (trace && trace_n <= 32) {
+            if (object >= 0x10000u && (object & 3u) == 0 &&
+                (object <= 0x03FFFFF8u ||
+                 (object >= 0x80000000u && object <= 0x83FFFFF8u))) {
+                trace_hdr = BRIDGE_MEM32(object);
+                trace_state = BRIDGE_MEM32(object + 4);
+                trace_guest_words = 1;
+            }
             fprintf(stderr, "  [WAITTRACE] enter n=%ld caller=0x%08X "
-                    "object=0x%08X path=%s host=%p reason=%u mode=%u "
+                    "object=0x%08X path=%s host=%p guest_words=%d "
+                    "hdr=0x%08X signal_state=0x%08X reason=%u mode=%u "
                     "alert=%u timeout_ptr=0x%08X\n", trace_n,
                     g_xbox_kernel_caller, object, path, (void *)h,
+                    trace_guest_words, trace_hdr, trace_state,
                     wait_reason, wait_mode, alertable, timeout_ptr);
             fflush(stderr);
         }
@@ -3048,11 +3059,11 @@ static void kernel_sw5_isr_pump(void)
     pmc_irq_enable = BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_EN_0);
     pmc_enable = BRIDGE_MEM32(XBOX_NV2A_REG_BASE + SW5_PMC_ENABLE);
     pgraph_enable = BRIDGE_MEM32(XBOX_NV2A_REG_BASE + SW5_PGRAPH_INTR_EN);
-    /* ATV enables the PMC hardware line and PGRAPH block but leaves the
-     * per-source PGRAPH notify mask at zero. Method 5 is the driver's software
-     * fence trap, so use the registered vector-3 path rather than waiting for
-     * that unused hardware mask to be set. */
-    if (!(pmc_irq_enable & 1u) || !(pmc_enable & SW5_PMC_ENABLE_PGRAPH)) {
+    /* Method 5 is the title's software fence source. PMC_INTR_EN_0 is cleared
+     * by the XDK ISR while its DPC is queued/running, so it cannot gate this
+     * software-vector handoff. The title also leaves the per-source PGRAPH
+     * notify mask clear; dispatch through vector 3 and the guest dispatch gate. */
+    if (!(pmc_enable & SW5_PMC_ENABLE_PGRAPH)) {
         if (InterlockedIncrement(&s_sw5_isr_wait_logs) <= 4) {
             fprintf(stderr, "  [SW5ISR] pending; gates PMC_HW=0x%08X "
                     "PMC_ENABLE=0x%08X PGRAPH_NOTIFY_EN=0x%08X\n",

@@ -57,6 +57,16 @@ uint32_t nv2a_vsh_input_mask(void);
 /* Instructions in the loaded program: for the profile, which needs to know
  * whether a vertex costs 40 instructions or 200. */
 uint32_t nv2a_vsh_ops(void);
+/* Read-only identity for diagnostics; hash is 32-bit FNV-1a over the
+ * little-endian instruction bytes through FINAL, recomputed with the decode cache. */
+uint32_t nv2a_vsh_start_slot(void);
+uint32_t nv2a_vsh_program_hash(void);
+
+/* Enumerate unique constant-source operands used by the decoded program.
+ * Returns the number of unique (index, relative) pairs; relative[i] is 1
+ * when the operand is addressed as c[index + a0.x]. */
+uint32_t nv2a_vsh_program_constant_refs(uint32_t *indices, uint8_t *relative,
+                                        uint32_t capacity);
 
 /* Direct access, for the self-test. */
 void nv2a_vsh_set_constant(uint32_t index, const float v[4]);

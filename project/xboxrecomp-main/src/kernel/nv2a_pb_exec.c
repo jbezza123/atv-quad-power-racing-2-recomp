@@ -865,7 +865,7 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
     s_gpu.texs[0].color  = tex->color;
     s_gpu.texs[0].addr_u = 3;
     s_gpu.texs[0].addr_v = 3;
-    s_gpu.texs[0].palette = 0;          /* ponytail: no palettised formats */
+    s_gpu.texs[0].palette = tex->palette;
     s_gpu.texs[0].levels = 1;
     s_gpu.texs[0].filter = 0;
     s_gpu.texs[0].cube   = 0;
@@ -895,7 +895,7 @@ uint64_t nv2a_backend_texture_hash(const Nv2aTexture *tex)
     s_gpu.texs[0].color = tex->color;
     s_gpu.texs[0].addr_u = 3;
     s_gpu.texs[0].addr_v = 3;
-    s_gpu.texs[0].palette = 0;
+    s_gpu.texs[0].palette = tex->palette;
     s_gpu.texs[0].levels = 1;
     s_gpu.texs[0].filter = 0;
     s_gpu.texs[0].cube = 0;
@@ -2148,6 +2148,174 @@ static float fog_factor(float d);
 static Nv2aVertex *s_bverts;     /* about 5.5 MB: allocated by the first vertex */
 static uint32_t   s_bcount;
 
+/* Opt-in evidence for the projected-shadow investigation. Capture only a few
+ * guest inputs/outputs while the known shadow texture pair is bound, then emit
+ * them only if the completed draw passes the D3D backend's geometry predicate. */
+#define SHADOW_VSH_TRACE_MAX_VERTICES 8u
+#define SHADOW_VSH_TRACE_MAX_BATCHES  10u
+typedef struct {
+    uint32_t index, input_mask, program, start_slot, ops, hash;
+    float v0[4], v1[4];
+    Nv2aVshOutput out;
+} ShadowVshTraceSample;
+static ShadowVshTraceSample s_shadow_vsh_trace_samples[SHADOW_VSH_TRACE_MAX_VERTICES];
+static uint32_t s_shadow_vsh_trace_sample_count, s_shadow_vsh_trace_batches;
+static int s_shadow_vsh_trace_enabled = -1;
+
+static int shadow_vsh_trace_on(void)
+{
+    const char *env;
+    if (s_shadow_vsh_trace_enabled < 0) {
+        env = getenv("RECOMP_D3D_SHADOW_VSH_TRACE");
+        s_shadow_vsh_trace_enabled = env && env[0] && env[0] != '0';
+    }
+    return s_shadow_vsh_trace_enabled;
+}
+
+static int shadow_vsh_trace_texture_pair(void)
+{
+    const Texture *t0 = &s_gpu.texs[0], *t1 = &s_gpu.texs[1];
+    return t0->valid && t0->color == 0x06u && t0->width == 256u &&
+           t0->height == 256u && t1->valid && t1->color == 0x0Bu &&
+           t1->width == 128u && t1->height == 128u;
+}
+
+static void shadow_vsh_trace_capture(uint32_t index,
+                                    const float in[NV2A_VSH_INPUTS][4],
+                                    uint32_t input_mask,
+                                    const Nv2aVshOutput *out,
+                                    int program)
+{
+    ShadowVshTraceSample *sample;
+    if (!shadow_vsh_trace_on() || !shadow_vsh_trace_texture_pair() || !out ||
+        s_shadow_vsh_trace_sample_count >= SHADOW_VSH_TRACE_MAX_VERTICES)
+        return;
+    sample = &s_shadow_vsh_trace_samples[s_shadow_vsh_trace_sample_count++];
+    memset(sample, 0, sizeof(*sample));
+    sample->index = index;
+    sample->input_mask = input_mask;
+    sample->program = program != 0;
+    if (program) {
+        sample->start_slot = nv2a_vsh_start_slot();
+        sample->ops = nv2a_vsh_ops();
+        sample->hash = nv2a_vsh_program_hash();
+        if (in && (input_mask & 1u))
+            memcpy(sample->v0, in[0], sizeof(sample->v0));
+        if (in && (input_mask & 2u))
+            memcpy(sample->v1, in[1], sizeof(sample->v1));
+    }
+    sample->out = *out;
+}
+
+static int shadow_vsh_trace_batch_candidate(const Nv2aSurface *surface)
+{
+    uint32_t i;
+    float xmin, xmax, ymin, ymax, rhwmin;
+    if (!surface || surface->width != 640u || surface->height != 480u ||
+        s_bcount < 3u || s_bcount > 384u || !shadow_vsh_trace_texture_pair())
+        return 0;
+    xmin = xmax = s_bverts[0].x;
+    ymin = ymax = s_bverts[0].y;
+    rhwmin = s_bverts[0].rhw;
+    for (i = 1; i < s_bcount; ++i) {
+        const Nv2aVertex *v = &s_bverts[i];
+        if (v->x < xmin) xmin = v->x;
+        if (v->x > xmax) xmax = v->x;
+        if (v->y < ymin) ymin = v->y;
+        if (v->y > ymax) ymax = v->y;
+        if (v->rhw < rhwmin) rhwmin = v->rhw;
+    }
+    return !(ymax < 145.0f || ymin > 465.0f || xmax < 0.0f ||
+             xmin > 640.0f || rhwmin >= 0.95f);
+}
+
+static void shadow_vsh_trace_emit(const Nv2aSurface *surface)
+{
+    uint32_t constant_indices[NV2A_VSH_SLOTS * 3];
+    uint8_t constant_relative[NV2A_VSH_SLOTS * 3];
+    uint32_t i, c, batch_id, program, slot, ops, hash, input_mask;
+    uint32_t constant_count, constant_capacity = NV2A_VSH_SLOTS * 3;
+    float xmin, xmax, ymin, ymax, rhwmin;
+    if (!shadow_vsh_trace_on() || s_shadow_vsh_trace_batches >= SHADOW_VSH_TRACE_MAX_BATCHES ||
+        !shadow_vsh_trace_batch_candidate(surface))
+        return;
+    batch_id = ++s_shadow_vsh_trace_batches;
+    program = (s_gpu.xf_mode & 3u) == 2u;
+    slot = program ? nv2a_vsh_start_slot() : 0u;
+    ops = program ? nv2a_vsh_ops() : 0u;
+    hash = program ? nv2a_vsh_program_hash() : 0u;
+    input_mask = program ? nv2a_vsh_input_mask() : 0u;
+    constant_count = program ? nv2a_vsh_program_constant_refs(
+        constant_indices, constant_relative, constant_capacity) : 0u;
+    xmin = xmax = s_bverts[0].x;
+    ymin = ymax = s_bverts[0].y;
+    rhwmin = s_bverts[0].rhw;
+    for (i = 1; i < s_bcount; ++i) {
+        const Nv2aVertex *v = &s_bverts[i];
+        if (v->x < xmin) xmin = v->x;
+        if (v->x > xmax) xmax = v->x;
+        if (v->y < ymin) ymin = v->y;
+        if (v->y > ymax) ymax = v->y;
+        if (v->rhw < rhwmin) rhwmin = v->rhw;
+    }
+    fprintf(stderr,
+            "[D3D11-SHADOW-VSH] batch=%u flip=%u target=0x%08X verts=%u "
+            "path=%s xf_mode=%u slot=%u ops=%u hash=%08X input_mask=%04X "
+            "tex0=0x%08X/%02X tex1=0x%08X/%02X addr0=%u/%u addr1=%u/%u "
+            "xy=[%.2f..%.2f,%.2f..%.2f] rhw_min=%.6g samples=%u\n",
+            batch_id, s_gpu.flips, surface->color_va, s_bcount,
+            program ? "guest-vsh" : "fixed-function", s_gpu.xf_mode,
+            slot, ops, hash, input_mask,
+            s_gpu.texs[0].offset, s_gpu.texs[0].color & 0xFFu,
+            s_gpu.texs[1].offset, s_gpu.texs[1].color & 0xFFu,
+            s_gpu.texs[0].addr_u, s_gpu.texs[0].addr_v,
+            s_gpu.texs[1].addr_u, s_gpu.texs[1].addr_v,
+            xmin, xmax, ymin, ymax, rhwmin, s_shadow_vsh_trace_sample_count);
+    if (program) {
+        uint32_t logged = constant_count < constant_capacity ? constant_count : constant_capacity;
+        fprintf(stderr, "[D3D11-SHADOW-VSH-CONST-REFS] batch=%u unique=%u logged=%u\n",
+                batch_id, constant_count, logged);
+        for (c = 0; c < logged; ++c) {
+            uint32_t index = constant_indices[c];
+            if (index < NV2A_VSH_CONSTANTS) {
+                const float *v = nv2a_vsh_constant(index);
+                fprintf(stderr,
+                        "[D3D11-SHADOW-VSH-CONST-REF] batch=%u c[%u] rel=%u value=(%.9g,%.9g,%.9g,%.9g)\n",
+                        batch_id, index, constant_relative[c],
+                        v[0], v[1], v[2], v[3]);
+            } else {
+                fprintf(stderr,
+                        "[D3D11-SHADOW-VSH-CONST-REF] batch=%u c[%u] rel=%u value=<out-of-range>\n",
+                        batch_id, index, constant_relative[c]);
+            }
+        }
+    }
+    for (i = 0; i < s_shadow_vsh_trace_sample_count; ++i) {
+        const ShadowVshTraceSample *sample = &s_shadow_vsh_trace_samples[i];
+        const Nv2aVshOutput *o = &sample->out;
+        fprintf(stderr,
+                "[D3D11-SHADOW-VSH-OUT] batch=%u sample=%u index=%u path=%s slot=%u ops=%u hash=%08X input_mask=%04X "
+                "v0=(%.9g,%.9g,%.9g,%.9g) v1=(%.9g,%.9g,%.9g,%.9g) "
+                "oPos=(%.9g,%.9g,%.9g,%.9g) oD0=(%.9g,%.9g,%.9g,%.9g) "
+                "oD1=(%.9g,%.9g,%.9g,%.9g) oFog=(%.9g,%.9g,%.9g,%.9g) "
+                "oT0=(%.9g,%.9g,%.9g,%.9g) oT1=(%.9g,%.9g,%.9g,%.9g) "
+                "oT2=(%.9g,%.9g,%.9g,%.9g) oT3=(%.9g,%.9g,%.9g,%.9g)\n",
+                batch_id, i, sample->index, sample->program ? "guest-vsh" : "fixed-function",
+                sample->start_slot, sample->ops, sample->hash, sample->input_mask,
+                sample->v0[0], sample->v0[1], sample->v0[2], sample->v0[3],
+                sample->v1[0], sample->v1[1], sample->v1[2], sample->v1[3],
+                o->pos[0], o->pos[1], o->pos[2], o->pos[3],
+                o->d0[0], o->d0[1], o->d0[2], o->d0[3],
+                o->d1[0], o->d1[1], o->d1[2], o->d1[3],
+                o->fog[0], o->fog[1], o->fog[2], o->fog[3],
+                o->tex[0][0], o->tex[0][1], o->tex[0][2], o->tex[0][3],
+                o->tex[1][0], o->tex[1][1], o->tex[1][2], o->tex[1][3],
+                o->tex[2][0], o->tex[2][1], o->tex[2][2], o->tex[2][3],
+                o->tex[3][0], o->tex[3][1], o->tex[3][2], o->tex[3][3]);
+    }
+    fflush(stderr);
+}
+
 static Nv2aVertex *backend_slot(void)
 {
     if (!s_bverts
@@ -2195,8 +2363,10 @@ static void backend_flush(int textured)
     Nv2aBatch batch;
     uint32_t st;
 
-    if (!s_bcount)
+    if (!s_bcount) {
+        s_shadow_vsh_trace_sample_count = 0;
         return;
+    }
     if (s_backend_flush_logs < 3) {
         fprintf(stderr, "[NV2A-BACKEND] flush %u: backend=%s textured=%d verts=%u\n",
                 s_backend_flush_logs + 1, s_backend ? "registered" : "none",
@@ -2221,6 +2391,7 @@ static void backend_flush(int textured)
         tex[st].height = s_gpu.texs[st].height;
         tex[st].pitch  = s_gpu.texs[st].pitch;
         tex[st].color  = s_gpu.texs[st].color;
+        tex[st].palette = s_gpu.texs[st].palette;
         tex[st].addr_u = s_gpu.texs[st].addr_u;
         tex[st].addr_v = s_gpu.texs[st].addr_v;
         tex[st].levels = s_gpu.texs[st].pitch ? 1 : s_gpu.texs[st].levels;
@@ -2228,9 +2399,11 @@ static void backend_flush(int textured)
         batch.textures[st] = &tex[st];
     }
     batch.texture = batch.textures[0];
+    shadow_vsh_trace_emit(&surf);
     s_backend->draw(&surf, &batch);
     s_gpu.tris_drawn += s_bcount / 3;
     s_bcount = 0;
+    s_shadow_vsh_trace_sample_count = 0;
     note_drawn();
 }
 
@@ -3207,8 +3380,12 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
     uint64_t t0 = 0, t1 = 0;
     int profile = xf_profile_wanted();
 
-    if (!batch_uses_program())
-        return ffp_vertex(index, out);
+    if (!batch_uses_program()) {
+        if (!ffp_vertex(index, out))
+            return 0;
+        shadow_vsh_trace_capture(index, NULL, 0, out, 0);
+        return 1;
+    }
     if (profile)
         t0 = xbox_HostNowNs();
     inmask = nv2a_vsh_input_mask();
@@ -3235,6 +3412,7 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
         t1 = xbox_HostNowNs();
     if (!nv2a_vsh_run((const float (*)[4])in, out))
         return 0;
+    shadow_vsh_trace_capture(index, (const float (*)[4])in, inmask, out, 1);
     if (profile) {
         uint64_t t2 = xbox_HostNowNs();
         s_xf_instr += nv2a_vsh_ops();

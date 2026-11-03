@@ -40,6 +40,7 @@ static float    s_const[NV2A_VSH_CONSTANTS][4];
 static uint32_t s_load_slot, s_load_word, s_start_slot;
 static uint32_t s_const_load, s_const_word;
 static uint32_t s_cxt_write;
+static uint32_t s_ops_hash;
 static int      s_const_trace = -1;      /* RECOMP_VSH_DUMP: constant traffic */
 
 static int vsh_dump_enabled(void)
@@ -91,11 +92,19 @@ static void decode_program(void)
     s_ops_valid = 1;
     s_ops_count = 0;
     s_ops_inmask = 0;
+    s_ops_hash = 2166136261u;
     for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
         const uint32_t *ins = s_program[s];
         VshOp *op = &s_ops[n];
         uint32_t tdst, mac;
-        int i;
+        int i, b;
+
+        for (i = 0; i < 4; i++) {
+            for (b = 0; b < 4; b++) {
+                s_ops_hash ^= (ins[i] >> (b * 8)) & 0xFFu;
+                s_ops_hash *= 16777619u;
+            }
+        }
 
         op->mac = (uint8_t)field(ins, 1, 21, 4);
         op->ilu = (uint8_t)field(ins, 1, 25, 3);
@@ -172,6 +181,8 @@ static void decode_program(void)
     if (n && !s_ops[n - 1].final)
         n = 0;                      /* no FINAL: no program to run */
     s_ops_count = n;
+    if (!n)
+        s_ops_hash = 0;
 }
 
 static __forceinline vec4 read_src_dec(const VshOp *op, int which,
@@ -651,4 +662,53 @@ uint32_t nv2a_vsh_ops(void)
     if (!s_ops_valid)
         decode_program();
     return s_ops_count;
+}
+
+uint32_t nv2a_vsh_start_slot(void)
+{
+    return s_start_slot;
+}
+
+uint32_t nv2a_vsh_program_hash(void)
+{
+    if (!s_ops_valid)
+        decode_program();
+    return s_ops_hash;
+}
+
+uint32_t nv2a_vsh_program_constant_refs(uint32_t *indices, uint8_t *relative,
+                                        uint32_t capacity)
+{
+    uint32_t n, source, count = 0;
+    if (!s_ops_valid)
+        decode_program();
+    for (n = 0; n < s_ops_count; ++n) {
+        const VshOp *op = &s_ops[n];
+        for (source = 0; source < 3; ++source) {
+            uint32_t j;
+            uint8_t index, rel;
+            int duplicate = 0;
+            /* Match read_src_dec(): 1 selects a temp and 2 an input; all other
+             * selectors take its default path through the constant file. */
+            if (!(op->need & (1u << source)) ||
+                op->src[source].mux == 1 || op->src[source].mux == 2)
+                continue;
+            index = op->src[source].ci;
+            rel = op->src[source].rel;
+            for (j = 0; j < count && j < capacity; ++j) {
+                if (indices[j] == index && relative[j] == rel) {
+                    duplicate = 1;
+                    break;
+                }
+            }
+            if (duplicate)
+                continue;
+            if (count < capacity) {
+                indices[count] = index;
+                relative[count] = rel;
+            }
+            ++count;
+        }
+    }
+    return count;
 }

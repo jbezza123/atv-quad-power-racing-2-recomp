@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "project_name": "ATV Quad Power Racing 2 Recompilation",
+  "cmake_source": "game_project",
+  "engine_source": "xboxrecomp-main",
+  "generator": "Visual Studio 17 2022",
+  "architecture": "x64",
+  "configuration": "Release",
+  "target": "my_xbox_game",
+  "executable_relative_to_build": "Release/my_xbox_game.exe",
+  "executable_name": "my_xbox_game.exe",
+  "minimum_cmake": "3.20"
+}
