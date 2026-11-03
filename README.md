@@ -28,38 +28,9 @@ The scripts in `tools/` can extract indexed stored blocks from the game archives
 
 You must provide your own legally obtained copy of ATV Quad Power Racing 2. This project is an independent recompilation effort and is not endorsed by Microsoft or the game publisher. No game data is included here. The bundled XISO utility is XboxDev `extract-xiso` release `build-202609111233`; its license and required acknowledgement are included under `licenses/extract-xiso/` and in `THIRD_PARTY_NOTICES.md`. The `xboxrecomp-main` source includes its own license/notices. Review applicable rights and licenses before redistributing changes.
 
+
+
 ## Generated and local files
 
 The root `.gitignore` excludes the extracted `game/` data, local build output, logs, temporary staging, backups, and the generated game executable. The project source and build wizard remain available to commit or upload; no Git commit or upload is performed by this package.
 
-## Screenshots
-
-<p align="center">
-  <img src="screenshots/rider select screen.jpg" width="45%" alt="Rider Select Screen" />
-  <img src="screenshots/atv select.jpg" width="45%" alt="ATV Select Screen" />
-</p>
-
-<p align="center">
-  <img src="screenshots/track select.jpg" width="45%" alt="Track Select Screen" />
-  <img src="screenshots/track intro.jpg" width="45%" alt="Track Intro View" />
-</p>
-
-<p align="center">
-  <img src="screenshots/sun and shadows glitch.jpg" width="45%" alt="Sun and Shadows Diagnostic" />
-  <img src="screenshots/loading-target-82809000-20261101.png" width="45%" alt="Loading Target" />
-</p>
-
-<p align="center">
-  <img src="screenshots/race_actor_alpha_test_ab_20261101_frame_sync.png" width="45%" alt="Race Actor Alpha Test" />
-  <img src="screenshots/race_shadow_tile_trace_20261102_frame_latest.png" width="45%" alt="Race Shadow Tile Trace" />
-</p>
-
-<p align="center">
-  <img src="screenshots/race-depth-occlusion-unresolved-20261031.png" width="45%" alt="Race Depth Occlusion" />
-  <img src="screenshots/race-gray-sky-white-square-20261101.png" width="45%" alt="Race Gray Sky White Square" />
-</p>
-
-<p align="center">
-  <img src="screenshots/race-max-draws-3250-20261101.png" width="45%" alt="Race Max Draws" />
-  <img src="screenshots/race-sky-and-terrain-diagnostic-20261031.png" width="45%" alt="Race Sky and Terrain Diagnostic" />
-</p>
