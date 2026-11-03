@@ -35,17 +35,17 @@ The root `.gitignore` excludes the extracted `game/` data, local build output, l
 ## Screenshots
 
 <p align="center">
-  <img src="screenshots/rider_select_screen.jpg" width="45%" alt="Rider Select Screen" />
-  <img src="screenshots/atv_select.jpg" width="45%" alt="ATV Select Screen" />
+  <img src="screenshots/rider_select_screen.png" width="45%" alt="Rider Select Screen" />
+  <img src="screenshots/atv_select.png" width="45%" alt="ATV Select Screen" />
 </p>
 
 <p align="center">
-  <img src="screenshots/track_select.jpg" width="45%" alt="Track Select Screen" />
-  <img src="screenshots/track_intro.jpg" width="45%" alt="Track Intro View" />
+  <img src="screenshots/track_select.png" width="45%" alt="Track Select Screen" />
+  <img src="screenshots/track_intro.png" width="45%" alt="Track Intro View" />
 </p>
 
 <p align="center">
-  <img src="screenshots/sun_and_shadows_glitch.jpg" width="45%" alt="Sun and Shadows Diagnostic" />
+  <img src="screenshots/sun_and_shadows_glitch.png" width="45%" alt="Sun and Shadows Diagnostic" />
   <img src="screenshots/loading-target-82809000-20261101.png" width="45%" alt="Loading Target" />
 </p>
 
