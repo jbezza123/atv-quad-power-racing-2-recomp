@@ -27,9 +27,8 @@
     }
   ],
   "help": [
-    "Archive extraction (.BAH/.BAD file formats)",
-    "Directory structure mapping for loose external assets",
-    "Graphics rendering (depth buffering/Z-sorting and transparency draw order)"
+    "Getting sun to draw",
+    "mapping out remaining functions"
   ],
   "notes": "Static recompilation of ATV Quad Power Racing 2 (Xbox PAL) targeting native Windows execution with support for loose file overrides."
 }
