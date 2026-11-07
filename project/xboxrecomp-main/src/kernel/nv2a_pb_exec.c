@@ -2316,6 +2316,107 @@ static void shadow_vsh_trace_emit(const Nv2aSurface *surface)
     fflush(stderr);
 }
 
+#define SUN_VSH_TRACE_MAX_SAMPLES 16u
+static uint32_t s_sun_vsh_trace_samples;
+static int s_sun_vsh_trace_enabled = -1;
+
+static int sun_vsh_trace_on(void)
+{
+    if (s_sun_vsh_trace_enabled < 0) {
+        const char *env = getenv("RECOMP_D3D_SUN_VSH_TRACE");
+        s_sun_vsh_trace_enabled = env && env[0] && env[0] != '0';
+    }
+    return s_sun_vsh_trace_enabled;
+}
+
+static int sun_vsh_trace_texture_match(void)
+{
+    const Texture *t0 = &s_gpu.texs[0];
+    return t0->valid && t0->offset == 0x83283000u &&
+           t0->width == 256u && t0->height == 256u &&
+           (t0->color & 0xFFu) == 0x0Cu;
+}
+
+static void sun_vsh_trace_capture(uint32_t index,
+                                  const float in[NV2A_VSH_INPUTS][4],
+                                  uint32_t input_mask,
+                                  const Nv2aVshOutput *out,
+                                  int program)
+{
+    Nv2aSurface surface;
+    const Texture *t0 = &s_gpu.texs[0], *t1 = &s_gpu.texs[1];
+    uint32_t sample, a;
+    if (!sun_vsh_trace_on() || !sun_vsh_trace_texture_match() || !out ||
+        s_sun_vsh_trace_samples >= SUN_VSH_TRACE_MAX_SAMPLES)
+        return;
+
+    sample = ++s_sun_vsh_trace_samples;
+    if (sample == 1u) {
+        current_surface(&surface);
+        if (program) {
+            uint32_t indices[24], count, r, logged;
+            uint8_t relative[24];
+            const float *c58 = nv2a_vsh_constant(58u);
+            const float *c59 = nv2a_vsh_constant(59u);
+            count = nv2a_vsh_program_constant_refs(indices, relative, 24u);
+            logged = count < 24u ? count : 24u;
+            fprintf(stderr,
+                    "[D3D11-SUN-VSH-VIEWPORT] c58=(%.9g,%.9g,%.9g,%.9g) "
+                    "c59=(%.9g,%.9g,%.9g,%.9g) refs=%u logged=%u\n",
+                    c58[0], c58[1], c58[2], c58[3],
+                    c59[0], c59[1], c59[2], c59[3], count, logged);
+            for (r = 0; r < logged; ++r) {
+                const float *cv = nv2a_vsh_constant(indices[r]);
+                fprintf(stderr,
+                        "[D3D11-SUN-VSH-CONST] c[%u] relative=%u "
+                        "(%.9g,%.9g,%.9g,%.9g)\n",
+                        indices[r], relative[r], cv[0], cv[1], cv[2], cv[3]);
+            }
+        }
+        fprintf(stderr,
+                "[D3D11-SUN-VSH] target=0x%08X flip=%u prim=%u idx_count=%u "
+                "xf_mode=%u path=%s slot=%u ops=%u hash=%08X input_mask=%04X "
+                "tex0=0x%08X/%ux%u/fmt%02X tex1=0x%08X/%ux%u/fmt%02X max_samples=%u\n",
+                surface.color_va, s_gpu.flips, s_gpu.prim, s_gpu.idx_count,
+                s_gpu.xf_mode, program ? "guest-vsh" : "fixed-function",
+                program ? nv2a_vsh_start_slot() : 0u,
+                program ? nv2a_vsh_ops() : 0u,
+                program ? nv2a_vsh_program_hash() : 0u, input_mask,
+                t0->offset, t0->width, t0->height, t0->color & 0xFFu,
+                t1->valid ? t1->offset : 0u,
+                t1->valid ? t1->width : 0u,
+                t1->valid ? t1->height : 0u,
+                t1->valid ? t1->color & 0xFFu : 0u,
+                SUN_VSH_TRACE_MAX_SAMPLES);
+    }
+
+    if (in) {
+        for (a = 0; a < NV2A_VSH_INPUTS; ++a) {
+            if (input_mask & (1u << a)) {
+                fprintf(stderr,
+                        "[D3D11-SUN-VSH-IN] sample=%u index=%u v%u=(%.9g,%.9g,%.9g,%.9g)\n",
+                        sample, index, a, in[a][0], in[a][1], in[a][2], in[a][3]);
+            }
+        }
+    }
+    fprintf(stderr,
+            "[D3D11-SUN-VSH-OUT] sample=%u index=%u path=%s "
+            "oPos=(%.9g,%.9g,%.9g,%.9g) oD0=(%.9g,%.9g,%.9g,%.9g) "
+            "oD1=(%.9g,%.9g,%.9g,%.9g) oFog=(%.9g,%.9g,%.9g,%.9g) "
+            "oT0=(%.9g,%.9g,%.9g,%.9g) oT1=(%.9g,%.9g,%.9g,%.9g) "
+            "oT2=(%.9g,%.9g,%.9g,%.9g) oT3=(%.9g,%.9g,%.9g,%.9g)\n",
+            sample, index, program ? "guest-vsh" : "fixed-function",
+            out->pos[0], out->pos[1], out->pos[2], out->pos[3],
+            out->d0[0], out->d0[1], out->d0[2], out->d0[3],
+            out->d1[0], out->d1[1], out->d1[2], out->d1[3],
+            out->fog[0], out->fog[1], out->fog[2], out->fog[3],
+            out->tex[0][0], out->tex[0][1], out->tex[0][2], out->tex[0][3],
+            out->tex[1][0], out->tex[1][1], out->tex[1][2], out->tex[1][3],
+            out->tex[2][0], out->tex[2][1], out->tex[2][2], out->tex[2][3],
+            out->tex[3][0], out->tex[3][1], out->tex[3][2], out->tex[3][3]);
+    fflush(stderr);
+}
+
 static Nv2aVertex *backend_slot(void)
 {
     if (!s_bverts
@@ -3384,6 +3485,7 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
         if (!ffp_vertex(index, out))
             return 0;
         shadow_vsh_trace_capture(index, NULL, 0, out, 0);
+        sun_vsh_trace_capture(index, NULL, 0, out, 0);
         return 1;
     }
     if (profile)
@@ -3413,6 +3515,7 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
     if (!nv2a_vsh_run((const float (*)[4])in, out))
         return 0;
     shadow_vsh_trace_capture(index, (const float (*)[4])in, inmask, out, 1);
+    sun_vsh_trace_capture(index, (const float (*)[4])in, inmask, out, 1);
     if (profile) {
         uint64_t t2 = xbox_HostNowNs();
         s_xf_instr += nv2a_vsh_ops();

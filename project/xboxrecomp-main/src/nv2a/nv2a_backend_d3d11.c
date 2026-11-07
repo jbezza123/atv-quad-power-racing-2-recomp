@@ -125,9 +125,8 @@ static void invalidate_binding_cache(void)
 }
 static ID3D11Texture2D       *s_tex;
 static ID3D11ShaderResourceView *s_srv;
-static ID3D11SamplerState     *s_sampler;
-static ID3D11SamplerState     *s_shadow_stage_samplers[4];
-static uint32_t s_sampler_u, s_sampler_v, s_sampler_filter;
+static ID3D11SamplerState     *s_samplers[4];
+static uint32_t s_sampler_u[4], s_sampler_v[4], s_sampler_filter[4];
 static const char *s_texture_upload_failure;
 /* The frontend alternates through more than eight atlases during a menu
  * frame. Keep enough decoded resources resident to avoid upload thrashing;
@@ -167,10 +166,14 @@ static uint32_t s_sky_texture_route_mask;
 static uint32_t s_record_rt_dump_mask;
 static uint32_t s_panel_texture_dump_mask;
 static uint32_t s_target_texture_dump_mask;
+static uint32_t s_target_gpu_texture_dump_mask;
 static uint32_t s_shadow_texture_dump_mask;
 static uint32_t s_target_texture_dump_offsets[16];
 static uint32_t s_target_texture_dump_count;
 static int s_target_texture_dump_addresses_loaded;
+static uint32_t s_sun_sprite_texture_dump_mask;
+static uint32_t s_sun_sprite_texture_dump_offsets[32];
+static uint32_t s_sun_sprite_texture_dump_count;
 static int s_sky_texture_trace = -1;
 static int s_shadow_bound_texture_dumped;
 static int s_perf_trace;
@@ -205,6 +208,12 @@ static uint32_t s_panel_trace_samples;
 static uint32_t s_records_trace_samples;
 static int s_panel_frame_dump_done;
 static int s_panel_frame_capture_requested;
+static int s_menu_trace_enabled = -1;
+static uint32_t s_menu_trace_frames;
+static uint32_t s_menu_color_clears;
+static uint32_t s_menu_last_clear_flags;
+static uint32_t s_menu_last_clear_argb;
+static uint32_t s_menu_snapshots;
 static int s_probe;
 static int s_present_once;
 static int s_continuous;
@@ -407,21 +416,25 @@ static float d3d_depth_value(float z)
     return z;
 }
 
-static int update_sampler(const Nv2aTexture *t)
+static int update_sampler(const Nv2aTexture *t, uint32_t stage)
 {
     D3D11_SAMPLER_DESC sampler;
     HRESULT hr;
     uint32_t u, v, mag, min;
     int linear;
 
-    if (!t || !s_dev) return 0;
+    if (!t || !s_dev || stage >= 4) return 0;
     u = t->addr_u; v = t->addr_v;
     mag = (t->filter >> 24) & 0xF;
     min = (t->filter >> 16) & 0xFF;
     linear = mag == 2 || min == 2 || min == 4 || min == 6;
-    if (s_sampler && s_sampler_u == u && s_sampler_v == v &&
-        s_sampler_filter == (uint32_t)linear) return 1;
-    if (s_sampler) { ID3D11SamplerState_Release(s_sampler); s_sampler = NULL; }
+    if (s_samplers[stage] && s_sampler_u[stage] == u &&
+        s_sampler_v[stage] == v &&
+        s_sampler_filter[stage] == (uint32_t)linear) return 1;
+    if (s_samplers[stage]) {
+        ID3D11SamplerState_Release(s_samplers[stage]);
+        s_samplers[stage] = NULL;
+    }
     ZeroMemory(&sampler, sizeof(sampler));
     sampler.Filter = linear ? D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT
                              : D3D11_FILTER_MIN_MAG_MIP_POINT;
@@ -431,15 +444,17 @@ static int update_sampler(const Nv2aTexture *t)
     sampler.BorderColor[0] = sampler.BorderColor[1] = sampler.BorderColor[2] = 0.0f;
     sampler.BorderColor[3] = 0.0f;
     sampler.MaxLOD = D3D11_FLOAT32_MAX;
-    hr = ID3D11Device_CreateSamplerState(s_dev, &sampler, &s_sampler);
+    hr = ID3D11Device_CreateSamplerState(s_dev, &sampler, &s_samplers[stage]);
     if (FAILED(hr)) {
         s_texture_upload_failure = "sampler-create";
         return 0;
     }
-    s_sampler_u = u; s_sampler_v = v; s_sampler_filter = (uint32_t)linear;
+    s_sampler_u[stage] = u;
+    s_sampler_v[stage] = v;
+    s_sampler_filter[stage] = (uint32_t)linear;
     if (s_trace)
-        fprintf(stderr, "[D3D11-BACKEND] sampler address_u=%u address_v=%u filter=%s\n",
-                u, v, linear ? "linear" : "point");
+        fprintf(stderr, "[D3D11-BACKEND] sampler stage=%u address_u=%u address_v=%u filter=%s\n",
+                stage, u, v, linear ? "linear" : "point");
     return 1;
 }
 
@@ -760,9 +775,12 @@ static void release_all(void)
     if (s_ctx) ID3D11DeviceContext_ClearState(s_ctx);
     if (s_blend) ID3D11BlendState_Release(s_blend);
     if (s_rasterizer) ID3D11RasterizerState_Release(s_rasterizer);
-    if (s_sampler) ID3D11SamplerState_Release(s_sampler);
     {
         uint32_t i;
+        for (i = 0; i < 4; i++) {
+            if (s_samplers[i]) ID3D11SamplerState_Release(s_samplers[i]);
+            s_samplers[i] = NULL;
+        }
         for (i = 0; i < texture_cache_slots(); i++) {
             if (s_tex_cache[i].srv) ID3D11ShaderResourceView_Release(s_tex_cache[i].srv);
             if (s_tex_cache[i].texture) ID3D11Texture2D_Release(s_tex_cache[i].texture);
@@ -802,7 +820,7 @@ static void release_all(void)
     if (s_color) ID3D11Texture2D_Release(s_color);
     if (s_ctx && !s_direct) ID3D11DeviceContext_Release(s_ctx);
     if (s_dev && !s_direct) ID3D11Device_Release(s_dev);
-    s_blend = NULL; s_sampler = NULL; s_srv = NULL; s_tex = NULL;
+    s_blend = NULL; s_srv = NULL; s_tex = NULL;
     s_depth_disabled = NULL; s_depth_dynamic = NULL; s_layout = NULL;
     s_vs = NULL; s_ps = NULL; s_rcb = NULL; s_cb = NULL; s_vb = NULL;
     s_dsv = NULL; s_depth = NULL; s_readback = NULL;
@@ -824,12 +842,17 @@ static void release_all(void)
     s_records_trace_samples = 0;
     s_panel_frame_dump_done = 0;
     s_panel_frame_capture_requested = 0;
+    s_menu_trace_enabled = -1;
+    s_menu_trace_frames = s_menu_color_clears = s_menu_last_clear_flags = 0;
+    s_menu_last_clear_argb = s_menu_snapshots = 0;
     s_probe = s_present_once = s_continuous = s_present_pending = s_frame_limited = 0;
     s_direct = 0;
     s_blend_key_valid = s_depth_key_valid = s_raster_key_valid = 0;
     s_depth_logged = 0;
     s_depth_batches = 0;
-    s_sampler_u = s_sampler_v = s_sampler_filter = 0;
+    ZeroMemory(s_sampler_u, sizeof(s_sampler_u));
+    ZeroMemory(s_sampler_v, sizeof(s_sampler_v));
+    ZeroMemory(s_sampler_filter, sizeof(s_sampler_filter));
 }
 
 static ID3DBlob *compile_shader(const char *entry, const char *target)
@@ -1065,15 +1088,21 @@ static int create_target(uint32_t width, uint32_t height)
         if (FAILED(hr)) return 0;
     }
 
-    if (!s_sampler) {
-        ZeroMemory(&sampler, sizeof(sampler));
-        sampler.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-        sampler.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
-        sampler.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
-        sampler.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-        sampler.MaxLOD = D3D11_FLOAT32_MAX;
-        hr = ID3D11Device_CreateSamplerState(s_dev, &sampler, &s_sampler);
-        if (FAILED(hr)) return 0;
+    ZeroMemory(&sampler, sizeof(sampler));
+    sampler.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler.MaxLOD = D3D11_FLOAT32_MAX;
+    for (i = 0; i < 4; i++) {
+        if (!s_samplers[i]) {
+            hr = ID3D11Device_CreateSamplerState(s_dev, &sampler,
+                                                  &s_samplers[i]);
+            if (FAILED(hr)) return 0;
+            s_sampler_u[i] = 3;
+            s_sampler_v[i] = 3;
+            s_sampler_filter[i] = 1;
+        }
     }
 
     s_width = width; s_height = height;
@@ -1330,6 +1359,7 @@ static void dump_panel_texture_once(const Nv2aTexture *texture,
     const char *panel_prefix = getenv("RECOMP_D3D_PANEL_TEXTURE_DUMP_PREFIX");
     const char *target_prefix = getenv("RECOMP_D3D_TEXTURE_DUMP_PREFIX");
     const char *shadow_prefix = getenv("RECOMP_D3D_SHADOW_TEXTURE_DUMP_PREFIX");
+    const char *sun_sprite_prefix = getenv("RECOMP_D3D_SUN_SPRITE_DUMP_PREFIX");
     const char *prefix = NULL;
     FILE *file, *alpha_file;
     char path[512], alpha_path[512];
@@ -1345,6 +1375,8 @@ static void dump_panel_texture_once(const Nv2aTexture *texture,
     const char *log_tag = "[D3D11-PANEL-TEX]";
     int write_failed = 0;
     int panel_index, target_index;
+    uint32_t sun_sprite_slot = UINT32_MAX;
+    uint32_t sun_sprite_i;
 
     if (!texture || !pixels)
         return;
@@ -1373,6 +1405,24 @@ static void dump_panel_texture_once(const Nv2aTexture *texture,
             dump_mask = &s_target_texture_dump_mask;
             log_tag = "[D3D11-TEXTURE-DUMP]";
         }
+    }
+    if (!prefix && sun_sprite_prefix && *sun_sprite_prefix &&
+        (((texture->width == 256u && texture->height == 256u) ||
+          (texture->width == 128u && texture->height == 128u)) ||
+         ((texture->color & 0xFFu) == 0x0Cu &&
+          texture->width == 16u && texture->height == 16u))) {
+        for (sun_sprite_i = 0; sun_sprite_i < s_sun_sprite_texture_dump_count;
+             ++sun_sprite_i) {
+            if (s_sun_sprite_texture_dump_offsets[sun_sprite_i] == texture->offset)
+                return;
+        }
+        if (s_sun_sprite_texture_dump_count >= 32u)
+            return;
+        sun_sprite_slot = s_sun_sprite_texture_dump_count;
+        index = sun_sprite_slot;
+        prefix = sun_sprite_prefix;
+        dump_mask = &s_sun_sprite_texture_dump_mask;
+        log_tag = "[D3D11-SUN-SPRITE-TEX]";
     }
     if (!prefix || !dump_mask || !texture->width || !texture->height ||
         texture->width > 2048 || texture->height > 2048)
@@ -1466,6 +1516,10 @@ static void dump_panel_texture_once(const Nv2aTexture *texture,
     count = (uint64_t)texture->width * texture->height;
     hash = decoded_texture_sample_hash(pixels, texture->width, texture->height);
     *dump_mask |= bit;
+    if (sun_sprite_slot != UINT32_MAX) {
+        s_sun_sprite_texture_dump_offsets[s_sun_sprite_texture_dump_count++] =
+            texture->offset;
+    }
     fprintf(stderr,
         "%s guest=0x%08X size=%ux%u fmt=0x%02X hash=%016llX alpha=%u/%u/%u range=%u..%u white=%u black=%u rgb=%u..%u/%u..%u/%u..%u avg=%llu/%llu/%llu file=%s alpha_file=%s\n",
         log_tag, texture->offset, texture->width, texture->height, texture->color & 0xFF,
@@ -1475,6 +1529,205 @@ static void dump_panel_texture_once(const Nv2aTexture *texture,
         (unsigned long long)(r_sum / count),
         (unsigned long long)(g_sum / count),
         (unsigned long long)(b_sum / count), path, alpha_path);
+}
+
+static void trace_sun_all_draw(const Nv2aSurface *surface,
+                               const Nv2aBatch *batch)
+{
+    static unsigned count;
+    static unsigned priority_count;
+    const Nv2aTexture *t0;
+    const Nv2aTexture *t1;
+    const Nv2aVertex *v;
+    float xmin, xmax, ymin, ymax;
+    uint32_t i, draw_index;
+    const char *env = getenv("RECOMP_D3D_SUN_TRACE_ALL_DIRECT");
+    int priority, address_priority, signature_priority;
+    if (!env || env[0] == '0' || !surface || !batch || !batch->vertices ||
+        !batch->count || surface->width != 640 || surface->height != 480 ||
+        batch->count > 256u || !batch->state ||
+        (!getenv("RECOMP_D3D_SUN_TRACE_FOCUS_ANY") &&
+         !batch->state->blend_enable))
+        return;
+    t0 = batch->textures[0] ? batch->textures[0] : batch->texture;
+    t1 = batch->textures[1];
+    address_priority = t0 && getenv("RECOMP_D3D_SUN_TRACE_PRIORITY") &&
+        (t0->offset == 0x83283000u || t0->offset == 0x8326C000u);
+    signature_priority = t0 && getenv("RECOMP_D3D_SUN_TRACE_PRIORITY") &&
+        (((t0->color & 0xFFu) == 0x0Cu &&
+          t0->width == 256u && t0->height == 256u) ||
+         ((t0->color & 0xFFu) == 0x06u &&
+          t0->width == 128u && t0->height == 128u));
+    priority = address_priority;
+    if (!t0 && !getenv("RECOMP_D3D_SUN_TRACE_FOCUS_ANY"))
+        return;
+    v = batch->vertices;
+    xmin = xmax = v[0].x; ymin = ymax = v[0].y;
+    for (i = 1; i < batch->count; ++i) {
+        if (v[i].x < xmin) xmin = v[i].x;
+        if (v[i].x > xmax) xmax = v[i].x;
+        if (v[i].y < ymin) ymin = v[i].y;
+        if (v[i].y > ymax) ymax = v[i].y;
+    }
+    if (xmax - xmin < 2.0f || xmax - xmin > 320.0f ||
+        ymax - ymin < 2.0f || ymax - ymin > 320.0f)
+        return;
+    if (!address_priority && signature_priority &&
+        xmax - xmin <= 160.0f && ymax - ymin <= 160.0f &&
+        xmax >= 220.0f && xmin <= 420.0f &&
+        ymax >= 0.0f && ymin <= 180.0f)
+        priority = 1;
+    if ((priority && priority_count >= 64u) ||
+        (!priority && count >= 512u))
+        return;
+    if (!priority && getenv("RECOMP_D3D_SUN_TRACE_TINY") &&
+        (xmax - xmin > 64.0f || ymax - ymin > 64.0f))
+        return;
+    if (!priority && getenv("RECOMP_D3D_SUN_TRACE_FOCUS") &&
+        !(xmax >= 220.0f && xmin <= 420.0f &&
+          ymax >= 80.0f && ymin <= 280.0f))
+        return;
+    draw_index = priority ? priority_count++ : count++;
+    fprintf(stderr,
+        "[D3D11-SUN-ALL-DIRECT] n=%u priority=%u frame=%u draw=%u xy=[%.2f..%.2f,%.2f..%.2f] t0=0x%08X/%ux%u/fmt%02X t1=0x%08X/%ux%u/fmt%02X blend=1 src=0x%X dst=0x%X alpha=%u/0x%X/ref%u diffuse=%08X\n",
+        draw_index, priority != 0, s_frame_count + 1u, s_draw_count + 1u,
+        xmin, xmax, ymin, ymax,
+        t0->offset, t0->width, t0->height, t0->color & 0xFFu,
+        t1 ? t1->offset : 0u, t1 ? t1->width : 0u, t1 ? t1->height : 0u,
+        t1 ? t1->color & 0xFFu : 0u, batch->state->blend_src,
+        batch->state->blend_dst, batch->state->alpha_test_enable,
+        batch->state->alpha_func, batch->state->alpha_ref & 0xFFu, v[0].diffuse);
+}
+
+static void trace_sun_sprite_draw(const Nv2aSurface *surface,
+                                  const Nv2aBatch *batch)
+{
+static int enabled = -1;
+static int trace_init_white = -1;
+static uint32_t logged_envsun;
+static uint32_t logged_sprites[32];
+const Nv2aTexture *t0, *t1;
+const Nv2aVertex *v;
+const Nv2aRenderState *state;
+const Nv2aCombiner *comb;
+const char *env;
+const char *white_env;
+float xmin, xmax, ymin, ymax;
+float u0min, u0max, v0min, v0max;
+float u1min, u1max, v1min, v1max;
+uint32_t i, texture_slot = UINT32_MAX, draw_ordinal;
+int envsun_match = 0;
+int target_texture_slot = -1;
+int is_init_white = 0;
+
+    if (enabled < 0) {
+        env = getenv("RECOMP_D3D_SUN_ASSET_DRAW_TRACE");
+        enabled = env && env[0] && env[0] != '0';
+    }
+if (!enabled || !surface || !batch || !batch->vertices ||
+    !batch->count)
+    return;
+t0 = batch->textures[0] ? batch->textures[0] : batch->texture;
+t1 = batch->textures[1];
+is_init_white = (t0 && t0->offset == 0x8072A000u) ||
+                (t1 && t1->offset == 0x8072A000u);
+if (trace_init_white < 0) {
+    white_env = getenv("RECOMP_D3D_SUN_TRACE_INIT_WHITE");
+    trace_init_white = white_env && white_env[0] && white_env[0] != '0';
+}
+if (is_init_white && !trace_init_white)
+    return;
+if ((t0 && t0->offset == 0x82FA9000u) ||
+    (t1 && t1->offset == 0x82FA9000u))
+    envsun_match = 1;
+if (t0)
+    target_texture_slot = target_texture_dump_index(t0->offset);
+if (target_texture_slot < 0 && t1)
+    target_texture_slot = target_texture_dump_index(t1->offset);
+if (target_texture_slot >= 0)
+    texture_slot = (uint32_t)target_texture_slot;
+for (i = 0; i < s_sun_sprite_texture_dump_count; ++i) {
+    if (texture_slot == UINT32_MAX &&
+        ((t0 && t0->offset == s_sun_sprite_texture_dump_offsets[i]) ||
+        (t1 && t1->offset == s_sun_sprite_texture_dump_offsets[i]))) {
+        texture_slot = i;
+        break;
+    }
+}
+if (texture_slot == UINT32_MAX && !envsun_match)
+    return;
+if (texture_slot != UINT32_MAX) {
+    if (is_init_white) {
+        /* Count only spatially focused draws after their bounds are known. */
+        draw_ordinal = 0;
+    } else {
+        if (logged_sprites[texture_slot] >= 16u)
+            return;
+        draw_ordinal = ++logged_sprites[texture_slot];
+    }
+} else {
+    if (logged_envsun >= 64u)
+        return;
+    draw_ordinal = ++logged_envsun;
+}
+
+    v = batch->vertices;
+    xmin = xmax = v[0].x;
+    ymin = ymax = v[0].y;
+    u0min = u0max = v[0].tex[0][0];
+    v0min = v0max = v[0].tex[0][1];
+    u1min = u1max = v[0].tex[1][0];
+    v1min = v1max = v[0].tex[1][1];
+    for (i = 1; i < batch->count; ++i) {
+        if (batch->vertices[i].x < xmin) xmin = batch->vertices[i].x;
+        if (batch->vertices[i].x > xmax) xmax = batch->vertices[i].x;
+        if (batch->vertices[i].y < ymin) ymin = batch->vertices[i].y;
+        if (batch->vertices[i].y > ymax) ymax = batch->vertices[i].y;
+        if (batch->vertices[i].tex[0][0] < u0min) u0min = batch->vertices[i].tex[0][0];
+        if (batch->vertices[i].tex[0][0] > u0max) u0max = batch->vertices[i].tex[0][0];
+        if (batch->vertices[i].tex[0][1] < v0min) v0min = batch->vertices[i].tex[0][1];
+        if (batch->vertices[i].tex[0][1] > v0max) v0max = batch->vertices[i].tex[0][1];
+        if (batch->vertices[i].tex[1][0] < u1min) u1min = batch->vertices[i].tex[1][0];
+        if (batch->vertices[i].tex[1][0] > u1max) u1max = batch->vertices[i].tex[1][0];
+        if (batch->vertices[i].tex[1][1] < v1min) v1min = batch->vertices[i].tex[1][1];
+        if (batch->vertices[i].tex[1][1] > v1max) v1max = batch->vertices[i].tex[1][1];
+    }
+    if (texture_slot != UINT32_MAX && is_init_white) {
+        if ((xmax - xmin) > 320.0f || (ymax - ymin) > 220.0f ||
+            xmax < 120.0f || xmin > 520.0f ||
+            ymax < 0.0f || ymin > 220.0f)
+            return;
+        if (logged_sprites[texture_slot] >= 4096u)
+            return;
+        draw_ordinal = ++logged_sprites[texture_slot];
+    }
+    state = batch->state;
+    comb = batch->combiner;
+    fprintf(stderr,
+    "[D3D11-SUN-ASSET-DRAW] slot=%u n=%u frame=%u draw=%u target=0x%08X/%ux%u verts=%u xy=[%.2f..%.2f,%.2f..%.2f] tex0=0x%08X/%ux%u/fmt%02X uv0=[%.4f..%.4f,%.4f..%.4f] tex1=0x%08X/%ux%u/fmt%02X uv1=[%.4f..%.4f,%.4f..%.4f] comb=%08X prog=%08X alpha=%u/%04X/%u blend=%u/%X/%X depth=%u/%u diffuse=%08X\n",
+    texture_slot, draw_ordinal, s_frame_count + 1u, s_draw_count + 1u,
+        surface->color_va, surface->width, surface->height, batch->count,
+        xmin, xmax, ymin, ymax,
+        t0 ? t0->offset : 0u, t0 ? t0->width : 0u, t0 ? t0->height : 0u,
+        t0 ? t0->color & 0xFFu : 0u, u0min, u0max, v0min, v0max,
+        t1 ? t1->offset : 0u, t1 ? t1->width : 0u, t1 ? t1->height : 0u,
+        t1 ? t1->color & 0xFFu : 0u, u1min, u1max, v1min, v1max,
+        comb ? comb->control : 0u, comb ? comb->stage_program : 0u,
+        state ? state->alpha_test_enable : 0u,
+        state ? state->alpha_func : 0u, state ? state->alpha_ref & 0xFFu : 0u,
+        state ? state->blend_enable : 0u, state ? state->blend_src : 0u,
+        state ? state->blend_dst : 0u, state ? state->depth_test_enable : 0u,
+        state ? state->depth_write : 0u, v[0].diffuse);
+    if (batch->count <= 12u) {
+        for (i = 0; i < batch->count; ++i) {
+            fprintf(stderr,
+                "[D3D11-SUN-ASSET-VERTEX] slot=%u n=%u frame=%u draw=%u v=%u xy=(%.3f,%.3f) z=%.6g rhw=%.6g uv0=(%.6g,%.6g) uv1=(%.6g,%.6g) diffuse=%08X\n",
+                texture_slot, draw_ordinal, s_frame_count + 1u,
+                s_draw_count + 1u, i, v[i].x, v[i].y, v[i].z, v[i].rhw,
+                v[i].tex[0][0], v[i].tex[0][1],
+                v[i].tex[1][0], v[i].tex[1][1], v[i].diffuse);
+        }
+    }
 }
 
 static int record_rt_index(uint32_t color_va)
@@ -1501,11 +1754,15 @@ static void dump_record_rt_once(uint32_t slot,
                                 int shadow_bridge,
                                 int sampled_texture)
 {
-    const char *prefix = shadow_bridge ?
-        getenv("RECOMP_D3D_SHADOW_TEXTURE_DUMP_PREFIX") :
-        getenv("RECOMP_D3D_RECORD_RT_DUMP_PREFIX");
-    const char *dump_tag = sampled_texture ? "[D3D11-SHADOW-SAMPLED-TEX-DUMP]" :
-        (shadow_bridge ? "[D3D11-SHADOW-RT-DUMP]" : "[D3D11-RECORD-RT-DUMP]");
+    const char *target_gpu_prefix = getenv("RECOMP_D3D_TARGET_GPU_DUMP_PREFIX");
+    const char *prefix = sampled_texture && target_gpu_prefix && *target_gpu_prefix ?
+        target_gpu_prefix :
+        (shadow_bridge ? getenv("RECOMP_D3D_SHADOW_TEXTURE_DUMP_PREFIX") :
+         getenv("RECOMP_D3D_RECORD_RT_DUMP_PREFIX"));
+    const char *dump_tag = sampled_texture && target_gpu_prefix && *target_gpu_prefix ?
+        "[D3D11-TARGET-GPU-TEX-DUMP]" :
+        (sampled_texture ? "[D3D11-SHADOW-SAMPLED-TEX-DUMP]" :
+         (shadow_bridge ? "[D3D11-SHADOW-RT-DUMP]" : "[D3D11-RECORD-RT-DUMP]"));
     D3D11_TEXTURE2D_DESC desc;
     D3D11_MAPPED_SUBRESOURCE mapped;
     ID3D11Texture2D *staging = NULL;
@@ -1513,7 +1770,7 @@ static void dump_record_rt_once(uint32_t slot,
     FILE *file, *alpha_file = NULL;
     char path[512], alpha_path[512];
     uint8_t header[54], zero[3] = {0, 0, 0}, alpha_gray[3];
-    int index;
+    int index, target_index;
     uint32_t bit, row_bytes, pad, image_bytes, file_bytes;
     uint32_t x, y, nonzero_pixels = 0, nonzero_bytes = 0, or_byte = 0;
 
@@ -1522,10 +1779,19 @@ static void dump_record_rt_once(uint32_t slot,
         return;
     index = record_rt_index(entry->color_va);
     if (sampled_texture) {
-        if (s_shadow_bound_texture_dumped)
-            return;
-        s_shadow_bound_texture_dumped = 1;
-        bit = 0;
+        if (target_gpu_prefix && *target_gpu_prefix) {
+            target_index = target_texture_dump_index(entry->color_va);
+            if (target_index < 0)
+                return;
+            bit = 1u << (uint32_t)target_index;
+            if (s_target_gpu_texture_dump_mask & bit)
+                return;
+        } else {
+            if (s_shadow_bound_texture_dumped)
+                return;
+            s_shadow_bound_texture_dumped = 1;
+            bit = 0;
+        }
     } else if (shadow_bridge) {
         /* Keep one dump per distinct guest surface. The first format-0x06
          * 256x256 target is not necessarily the projected rider mask. */
@@ -1666,7 +1932,9 @@ static void dump_record_rt_once(uint32_t slot,
         fclose(alpha_file);
     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)staging, 0);
     ID3D11Texture2D_Release(staging);
-    if (shadow_bridge) s_shadow_texture_dump_mask |= bit;
+    if (sampled_texture && target_gpu_prefix && *target_gpu_prefix)
+        s_target_gpu_texture_dump_mask |= bit;
+    else if (shadow_bridge) s_shadow_texture_dump_mask |= bit;
     else s_record_rt_dump_mask |= bit;
     if (sampled_texture)
         fprintf(stderr, "%s guest=0x%08X stage=%u size=%ux%u nonzero_pixels=%u nonzero_bytes=%u OR=0x%02X file=%s\n",
@@ -1679,9 +1947,11 @@ static void dump_record_rt_once(uint32_t slot,
             entry->color_va, slot, entry->width, entry->height,
             nonzero_pixels, nonzero_bytes, or_byte, path);
     if (alpha_file)
-        fprintf(stderr, sampled_texture ?
-                "[D3D11-SHADOW-SAMPLED-TEX-DUMP-ALPHA] guest=0x%08X file=%s\n" :
-                "[D3D11-SHADOW-RT-DUMP-ALPHA] guest=0x%08X file=%s\n",
+        fprintf(stderr, sampled_texture && target_gpu_prefix && *target_gpu_prefix ?
+                "[D3D11-TARGET-GPU-TEX-DUMP-ALPHA] guest=0x%08X file=%s\n" :
+                (sampled_texture ?
+                 "[D3D11-SHADOW-SAMPLED-TEX-DUMP-ALPHA] guest=0x%08X file=%s\n" :
+                 "[D3D11-SHADOW-RT-DUMP-ALPHA] guest=0x%08X file=%s\n"),
                 entry->color_va, alpha_path);
 }
 
@@ -1698,6 +1968,169 @@ static void dump_bound_shadow_texture_once(uint32_t stage,
     sampled.width = texture->width;
     sampled.height = texture->height;
     dump_record_rt_once(stage, &sampled, 1, 1);
+}
+
+static void dump_sun_candidate_source_once(const Nv2aSurface *surface,
+                                           const Nv2aBatch *batch,
+                                           const Nv2aTexture *texture,
+                                           ID3D11ShaderResourceView *srv)
+{
+    static int done;
+    const char *prefix;
+    const Nv2aTexture *tex1;
+    ID3D11Resource *resource = NULL;
+    ID3D11Texture2D *source, *staging = NULL;
+    D3D11_TEXTURE2D_DESC desc;
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    HRESULT hr;
+    FILE *file = NULL, *alpha_file = NULL;
+    char path[512], alpha_path[512];
+    uint8_t header[54], padding[3] = {0, 0, 0}, gray[3];
+    uint32_t i, row_bytes, pad, image_bytes, file_bytes;
+    float xmin, xmax, ymin, ymax;
+    uint32_t alpha_zero = 0, alpha_partial = 0, alpha_opaque = 0;
+
+    if (done || !surface || surface->width != 640u || surface->height != 480u ||
+        !batch || batch->count != 6u || !batch->vertices || !batch->state ||
+        !batch->combiner || !nv2a_rc_is_atv_texture_diffuse(batch->combiner) ||
+        !texture || (texture->color & 0xFFu) != 0x06u ||
+        texture->width != 128u || texture->height != 128u ||
+        batch->combiner->control != 0x00011101u ||
+        batch->combiner->stage_program != 0x00000001u ||
+        !batch->state->blend_enable || !batch->state->alpha_test_enable ||
+        batch->state->alpha_func != 0x0206u ||
+        (batch->state->alpha_ref & 0xFFu) != 1u)
+        return;
+    tex1 = batch->textures[1];
+    if (!tex1 || (tex1->color & 0xFFu) != 0x0Cu ||
+        tex1->width != 128u || tex1->height != 128u)
+        return;
+
+    xmin = xmax = batch->vertices[0].x;
+    ymin = ymax = batch->vertices[0].y;
+    for (i = 1; i < batch->count; ++i) {
+        float x = batch->vertices[i].x;
+        float y = batch->vertices[i].y;
+        if (x < xmin) xmin = x;
+        if (x > xmax) xmax = x;
+        if (y < ymin) ymin = y;
+        if (y > ymax) ymax = y;
+    }
+    if (xmin < 200.0f || xmax > 440.0f || ymin < 0.0f || ymax > 130.0f ||
+        batch->vertices[0].diffuse != 0xBF808080u)
+        return;
+
+    fprintf(stderr,
+        "[D3D11-SUN-RT-MATCH] frame=%u draw=%u surface=0x%08X tex0=0x%08X/%ux%u/fmt%02X tex1=0x%08X/%ux%u/fmt%02X xy=[%.2f..%.2f,%.2f..%.2f] comb=%08X prog=%08X icw=%08X/%08X ocw=%08X/%08X final=%08X/%08X alpha=%u/%04X/%u blend=%u diffuse=%08X\n",
+        s_frame_count + 1, s_draw_count + 1, surface->color_va,
+        texture->offset, texture->width, texture->height, texture->color & 0xFFu,
+        tex1->offset, tex1->width, tex1->height, tex1->color & 0xFFu,
+        xmin, xmax, ymin, ymax, batch->combiner->control,
+        batch->combiner->stage_program, batch->combiner->color_icw[0],
+        batch->combiner->alpha_icw[0], batch->combiner->color_ocw[0],
+        batch->combiner->alpha_ocw[0], batch->combiner->final0,
+        batch->combiner->final1, batch->state->alpha_test_enable,
+        batch->state->alpha_func, batch->state->alpha_ref & 0xFFu,
+        batch->state->blend_enable, batch->vertices[0].diffuse);
+    done = 1;
+    prefix = getenv("RECOMP_D3D_SUN_RT_DUMP_PREFIX");
+    if (!prefix || !*prefix || !srv || !s_dev || !s_ctx) {
+        fprintf(stderr, "[D3D11-SUN-RT-DUMP] matched guest=0x%08X but no readable SRV/device\n",
+                texture->offset);
+        return;
+    }
+    ID3D11ShaderResourceView_GetResource(srv, &resource);
+    if (!resource) {
+        fprintf(stderr, "[D3D11-SUN-RT-DUMP] matched guest=0x%08X but SRV has no resource\n",
+                texture->offset);
+        return;
+    }
+    source = (ID3D11Texture2D *)resource;
+    ZeroMemory(&desc, sizeof(desc));
+    ID3D11Texture2D_GetDesc(source, &desc);
+    if (desc.Width != 128u || desc.Height != 128u || desc.SampleDesc.Count != 1u ||
+        desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+        fprintf(stderr, "[D3D11-SUN-RT-DUMP] unsupported guest=0x%08X size=%ux%u format=%u samples=%u\n",
+                texture->offset, desc.Width, desc.Height, (unsigned)desc.Format,
+                desc.SampleDesc.Count);
+        ID3D11Texture2D_Release(source);
+        return;
+    }
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    desc.MiscFlags = 0;
+    hr = ID3D11Device_CreateTexture2D(s_dev, &desc, NULL, &staging);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[D3D11-SUN-RT-DUMP] staging-create failed guest=0x%08X hr=0x%08X\n",
+                texture->offset, (unsigned)hr);
+        ID3D11Texture2D_Release(source);
+        return;
+    }
+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)staging, resource);
+    hr = ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)staging, 0,
+                                 D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[D3D11-SUN-RT-DUMP] map failed guest=0x%08X hr=0x%08X\n",
+                texture->offset, (unsigned)hr);
+        ID3D11Texture2D_Release(staging);
+        ID3D11Texture2D_Release(source);
+        return;
+    }
+
+    snprintf(path, sizeof(path), "%ssunrt_%08X.bmp", prefix, texture->offset);
+    snprintf(alpha_path, sizeof(alpha_path), "%ssunrt_%08X_alpha.bmp", prefix, texture->offset);
+    row_bytes = desc.Width * 3u;
+    pad = (4u - (row_bytes & 3u)) & 3u;
+    image_bytes = (row_bytes + pad) * desc.Height;
+    file_bytes = 54u + image_bytes;
+    ZeroMemory(header, sizeof(header));
+    header[0] = 'B'; header[1] = 'M';
+    memcpy(header + 2, &file_bytes, 4);
+    header[10] = 54; header[14] = 40;
+    memcpy(header + 18, &desc.Width, 4);
+    memcpy(header + 22, &desc.Height, 4);
+    header[26] = 1; header[28] = 24;
+    memcpy(header + 34, &image_bytes, 4);
+    file = fopen(path, "wb");
+    alpha_file = fopen(alpha_path, "wb");
+    if (!file || !alpha_file) {
+        fprintf(stderr, "[D3D11-SUN-RT-DUMP] output-open failed guest=0x%08X\n",
+                texture->offset);
+        if (file) fclose(file);
+        if (alpha_file) fclose(alpha_file);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)staging, 0);
+        ID3D11Texture2D_Release(staging);
+        ID3D11Texture2D_Release(source);
+        return;
+    }
+    fwrite(header, 1, sizeof(header), file);
+    fwrite(header, 1, sizeof(header), alpha_file);
+    for (i = 0; i < desc.Height; ++i) {
+        uint32_t x;
+        const uint8_t *row = (const uint8_t *)mapped.pData +
+            (size_t)(desc.Height - 1u - i) * mapped.RowPitch;
+        for (x = 0; x < desc.Width; ++x) {
+            const uint8_t *pixel = row + (size_t)x * 4u;
+            fwrite(pixel, 1, 3, file);
+            gray[0] = gray[1] = gray[2] = pixel[3];
+            fwrite(gray, 1, sizeof(gray), alpha_file);
+            if (pixel[3] == 0) alpha_zero++;
+            else if (pixel[3] == 255) alpha_opaque++;
+            else alpha_partial++;
+        }
+        if (pad) {
+            fwrite(padding, 1, pad, file);
+            fwrite(padding, 1, pad, alpha_file);
+        }
+    }
+    fclose(file);
+    fclose(alpha_file);
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)staging, 0);
+    ID3D11Texture2D_Release(staging);
+    ID3D11Texture2D_Release(source);
+    fprintf(stderr, "[D3D11-SUN-RT-DUMP] guest=0x%08X size=128x128 alpha=%u/%u/%u file=%s alpha_file=%s\n",
+            texture->offset, alpha_zero, alpha_partial, alpha_opaque, path, alpha_path);
 }
 
 /* Copy the current backbuffer to a 24-bit BMP. No once-only guard here: the
@@ -1900,7 +2333,7 @@ static void fps_report_tick(void)
     s_fps_frame_ms_len = 0;
 }
 
-static int upload_texture(const Nv2aTexture *t)
+static int upload_texture(const Nv2aTexture *t, uint32_t stage)
 {
     D3D11_TEXTURE2D_DESC td;
     D3D11_SHADER_RESOURCE_VIEW_DESC sd;
@@ -1926,6 +2359,9 @@ static int upload_texture(const Nv2aTexture *t)
             if (rt->srv && rt->color_va == t->offset &&
                 rt->width == t->width && rt->height == t->height) {
                 if (s_perf_trace) s_perf_texture_rt_hits++;
+                if (getenv("RECOMP_D3D_TARGET_GPU_DUMP_PREFIX") &&
+                    target_texture_dump_index(t->offset) >= 0)
+                    dump_record_rt_once(i, rt, 1, 1);
                 if (getenv("RECOMP_D3D_SHADOW_TEXTURE_DUMP_PREFIX") &&
                     (t->color & 0xFFu) == 0x06u && t->width == 256u && t->height == 256u)
                     dump_record_rt_once(i, rt, 1, 0);
@@ -1942,7 +2378,7 @@ static int upload_texture(const Nv2aTexture *t)
                 s_tex_offset = t->offset; s_tex_width = t->width;
                 s_tex_height = t->height; s_tex_pitch = t->pitch;
                 s_tex_color = t->color;
-                return update_sampler(t);
+                return update_sampler(t, stage);
             }
         }
     }
@@ -2009,11 +2445,21 @@ static int upload_texture(const Nv2aTexture *t)
                     free(updated);
                 }
             }
+            if (getenv("RECOMP_D3D_TARGET_GPU_DUMP_PREFIX") &&
+                target_texture_dump_index(t->offset) >= 0) {
+                D3DRenderTargetCacheEntry sampled;
+                ZeroMemory(&sampled, sizeof(sampled));
+                sampled.texture = entry->texture;
+                sampled.color_va = t->offset;
+                sampled.width = t->width;
+                sampled.height = t->height;
+                dump_record_rt_once(i, &sampled, 1, 1);
+            }
             entry->age = ++s_tex_cache_age;
             s_tex = entry->texture; s_srv = entry->srv;
             s_tex_offset = t->offset; s_tex_width = t->width;
             s_tex_height = t->height; s_tex_pitch = t->pitch; s_tex_color = t->color;
-            return update_sampler(t);
+            return update_sampler(t, stage);
         }
     }
     if (s_perf_trace) s_perf_texture_cache_misses++;
@@ -2034,7 +2480,8 @@ static int upload_texture(const Nv2aTexture *t)
     }
     if (panel_trace_enabled() ||
         getenv("RECOMP_D3D_TEXTURE_DUMP_PREFIX") ||
-        getenv("RECOMP_D3D_SHADOW_TEXTURE_DUMP_PREFIX"))
+        getenv("RECOMP_D3D_SHADOW_TEXTURE_DUMP_PREFIX") ||
+        getenv("RECOMP_D3D_SUN_SPRITE_DUMP_PREFIX"))
         dump_panel_texture_once(t, pixels);
     if (t->offset == 0x82809000 && sky_texture_trace_enabled()) {
         static unsigned sky_decode_trace_count;
@@ -2109,7 +2556,7 @@ static int upload_texture(const Nv2aTexture *t)
                 slot, t->width, t->height, t->color & 0xFF);
     if (s_trace && generate_mips)
         fprintf(stderr, "[D3D11-BACKEND] generated mip chain levels=%u\n", mip_levels);
-    return update_sampler(t);
+    return update_sampler(t, stage);
 }
 
 static void apply_render_state(const Nv2aRenderState *rs)
@@ -2252,6 +2699,18 @@ static void d3d11_clear(const Nv2aSurface *surface, const Nv2aRenderState *state
     float c[4];
     float depth_clear_value;
     uint32_t stencil_clear_value = 0;
+    if (s_menu_trace_enabled < 0) {
+        const char *menu_trace_env = getenv("RECOMP_D3D_MENU_TRACE");
+        s_menu_trace_enabled = menu_trace_env && menu_trace_env[0] &&
+                               menu_trace_env[0] != '0';
+    }
+    if (s_menu_trace_enabled && s_direct && surface && (flags & 0xF0u) &&
+        surface->width == (s_backbuffer_width ? s_backbuffer_width : 640u) &&
+        surface->height == (s_backbuffer_height ? s_backbuffer_height : 480u)) {
+        s_menu_color_clears++;
+        s_menu_last_clear_flags = flags;
+        s_menu_last_clear_argb = argb;
+    }
     if (depth_clear_override < 0) {
         const char *e = getenv("RECOMP_D3D_DEPTH_CLEAR");
         if (e && *e) {
@@ -2412,6 +2871,14 @@ static void d3d11_draw_impl(const Nv2aSurface *surface, const Nv2aBatch *batch)
     static uint32_t shadow_route_trace_count;
     static uint32_t shadow_skip_frame = UINT32_MAX, shadow_skip_ordinal;
     static int actor_alpha_capture_requested;
+    static int sun_rt_capture_enabled = -1;
+    static int sun_only_enabled = -1;
+    static int sun_only_force_state = -1;
+    static int sun_only_trace = -1;
+    static int sun_force_blend_one = -1;
+    static int sun_force_blend_src_alpha = -1;
+    static int sun_force_blend_src_alpha_inv_src_alpha = -1;
+    static unsigned sun_only_skipped, sun_only_allowed;
     D3D11_MAPPED_SUBRESOURCE map;
     D3D11_VIEWPORT vp;
     UINT stride = sizeof(D3DVertex), offset = 0;
@@ -2433,8 +2900,10 @@ static void d3d11_draw_impl(const Nv2aSurface *surface, const Nv2aBatch *batch)
     const char *shadow_no_cull_env;
     const char *shadow_force_combiner_env;
     const char *shadow_route_trace_env;
+    const char *sun_rt_capture_env;
     Nv2aRenderState shadow_blend_state;
     Nv2aRenderState actor_depth_state;
+    Nv2aRenderState sun_blend_state;
     const Nv2aRenderState *render_state;
     const Nv2aTexture *shadow_tex0, *shadow_tex1;
     float far_racer_xmin, far_racer_xmax, far_racer_ymin, far_racer_ymax;
@@ -2445,14 +2914,15 @@ static void d3d11_draw_impl(const Nv2aSurface *surface, const Nv2aBatch *batch)
     int actor_alpha_test_override = 0;
     int shadow_candidate = 0;
     int shadow_dump_candidate = 0;
+    int sun_stage1_bridge_candidate = 0;
+    int sun_only_match = 0;
     uint32_t i;
     LARGE_INTEGER perf_stage_last;
     (void)surface;
-    for (i = 0; i < 4; i++) {
-        if (s_shadow_stage_samplers[i]) {
-            ID3D11SamplerState_Release(s_shadow_stage_samplers[i]);
-            s_shadow_stage_samplers[i] = NULL;
-        }
+    if (sun_rt_capture_enabled < 0) {
+        sun_rt_capture_env = getenv("RECOMP_D3D_SUN_RT_DUMP_PREFIX");
+        sun_rt_capture_enabled = sun_rt_capture_env && sun_rt_capture_env[0] &&
+                                sun_rt_capture_env[0] != '0';
     }
     if (s_perf_trace) QueryPerformanceCounter(&perf_stage_last);
     if (!s_draw_entry_logged) {
@@ -2538,9 +3008,95 @@ static void d3d11_draw_impl(const Nv2aSurface *surface, const Nv2aBatch *batch)
                 batch && batch->texture ? "yes" : "no");
     }
     if (!batch || !batch->vertices || batch->count < 3) return;
+    if (sun_only_enabled < 0) {
+        const char *sun_only_env = getenv("RECOMP_D3D_SUN_ONLY");
+        sun_only_enabled = sun_only_env && sun_only_env[0] &&
+                           sun_only_env[0] != '0';
+        if (sun_only_enabled)
+            fprintf(stderr, "[D3D11-SUN-ONLY] enabled; preserving only confirmed Sprites/Sun guest texture 0x83283000\n");
+    }
+    if (sun_only_force_state < 0) {
+        const char *sun_force_env = getenv("RECOMP_D3D_SUN_ONLY_FORCE_STATE");
+        sun_only_force_state = sun_force_env && sun_force_env[0] &&
+                               sun_force_env[0] != '0';
+    }
+    if (sun_only_trace < 0) {
+        const char *sun_trace_env = getenv("RECOMP_D3D_SUN_ONLY_TRACE");
+        sun_only_trace = sun_trace_env && sun_trace_env[0] &&
+                         sun_trace_env[0] != '0';
+    }
+    if (sun_force_blend_one < 0) {
+        const char *sun_blend_env = getenv("RECOMP_D3D_SUN_FORCE_BLEND_ONE");
+        sun_force_blend_one = sun_blend_env && sun_blend_env[0] &&
+                              sun_blend_env[0] != '0';
+    }
+    if (sun_force_blend_src_alpha < 0) {
+        const char *sun_blend_alpha_env = getenv("RECOMP_D3D_SUN_FORCE_BLEND_SRC_ALPHA");
+        sun_force_blend_src_alpha = sun_blend_alpha_env && sun_blend_alpha_env[0] &&
+                                    sun_blend_alpha_env[0] != '0';
+    }
+    if (sun_force_blend_src_alpha_inv_src_alpha < 0) {
+        const char *sun_blend_alpha_inv_env = getenv("RECOMP_D3D_SUN_FORCE_BLEND_SRC_ALPHA_INV_SRC_ALPHA");
+        sun_force_blend_src_alpha_inv_src_alpha = sun_blend_alpha_inv_env &&
+            sun_blend_alpha_inv_env[0] && sun_blend_alpha_inv_env[0] != '0';
+    }
+    if (sun_only_enabled) {
+        for (i = 0; i < 4; ++i) {
+            const Nv2aTexture *candidate = i == 0 ?
+                (batch->textures[0] ? batch->textures[0] : batch->texture) :
+                batch->textures[i];
+            if (candidate && candidate->offset == 0x83283000u) {
+                sun_only_match = 1;
+                break;
+            }
+        }
+        if (!sun_only_match) {
+            if (sun_only_skipped < 4u)
+                fprintf(stderr, "[D3D11-SUN-ONLY-SKIP] frame=%u draw=%u verts=%u\n",
+                        s_frame_count + 1u, s_draw_count + 1u, batch->count);
+            ++sun_only_skipped;
+            return;
+        }
+        if (sun_only_allowed < 16u) {
+            fprintf(stderr, "[D3D11-SUN-ONLY-ALLOW] frame=%u draw=%u verts=%u\n",
+                    s_frame_count + 1u, s_draw_count + 1u, batch->count);
+            ++sun_only_allowed;
+        }
+    }
+    if ((!sun_only_enabled && sun_only_trace) ||
+        (!sun_only_match && (sun_force_blend_one || sun_force_blend_src_alpha ||
+                             sun_force_blend_src_alpha_inv_src_alpha))) {
+        for (i = 0; i < 4; ++i) {
+            const Nv2aTexture *candidate = i == 0 ?
+                (batch->textures[0] ? batch->textures[0] : batch->texture) :
+                batch->textures[i];
+            if (candidate && candidate->offset == 0x83283000u) {
+                sun_only_match = 1;
+                break;
+            }
+        }
+    }
     far_racer_alpha_override = 0;
     shadow_tex0 = batch->textures[0] ? batch->textures[0] : batch->texture;
     shadow_tex1 = batch->textures[1];
+    if (surface->width == 640u && surface->height == 480u &&
+        batch->count == 6u && batch->state && batch->combiner &&
+        shadow_tex0 && shadow_tex1 && shadow_tex0->offset == 0x8072A000u &&
+        (shadow_tex1->color & 0xFFu) == 0x06u &&
+        shadow_tex1->width == 256u && shadow_tex1->height == 256u &&
+        batch->combiner->control == 0x00011101u &&
+        batch->combiner->stage_program == 0x00000001u &&
+        batch->state->blend_enable && batch->state->alpha_test_enable &&
+        batch->state->alpha_func == 0x0206u &&
+        (batch->state->alpha_ref & 0xFFu) == 1u &&
+        getenv("RECOMP_D3D_SUN_STAGE1_BRIDGE_DUMP")) {
+        sun_stage1_bridge_candidate = 1;
+        fprintf(stderr,
+            "[D3D11-SUN-STAGE1-BRIDGE-CANDIDATE] frame=%u draw=%u tex0=0x%08X tex1=0x%08X/%ux%u/fmt%02X\n",
+            s_frame_count + 1u, s_draw_count + 1u, shadow_tex0->offset,
+            shadow_tex1->offset, shadow_tex1->width, shadow_tex1->height,
+            shadow_tex1->color & 0xFFu);
+    }
     if (force_far_racer_alpha_off && surface->width == 640 && surface->height == 480 &&
         batch->state && batch->state->alpha_test_enable && !batch->state->blend_enable &&
         batch->state->alpha_func == 0x0206 && batch->state->alpha_ref == 128 &&
@@ -2679,13 +3235,11 @@ static void d3d11_draw_impl(const Nv2aSurface *surface, const Nv2aBatch *batch)
         tex_stage[st] = batch->textures[st];
         if (!tex_stage[st] && st == 0)
             tex_stage[st] = batch->texture;
-        if (tex_stage[st] && upload_texture(tex_stage[st])) {
+        if (tex_stage[st] && upload_texture(tex_stage[st], (uint32_t)st)) {
             if (shadow_dump_candidate && st == 0)
                 dump_bound_shadow_texture_once((uint32_t)st, tex_stage[st], s_tex);
-            if (shadow_dump_candidate && shadow_per_stage_sampler_test && s_sampler) {
-                ID3D11SamplerState_AddRef(s_sampler);
-                s_shadow_stage_samplers[st] = s_sampler;
-            }
+            if (sun_stage1_bridge_candidate && st == 1)
+                dump_bound_shadow_texture_once((uint32_t)st, tex_stage[st], s_tex);
             srvs[st] = s_srv;
             any_texture = 1;
         } else if (shadow_dump_candidate && shadow_per_stage_sampler_test && tex_stage[st]) {
@@ -2891,40 +3445,27 @@ static void d3d11_draw_impl(const Nv2aSurface *surface, const Nv2aBatch *batch)
             }
         }
     }
-    if (shadow_dump_candidate && shadow_per_stage_sampler_test) {
-        for (st = 0; st < 4; st++)
-            samplers[st] = s_shadow_stage_samplers[st] ?
-                s_shadow_stage_samplers[st] : s_sampler;
-        if (!shadow_per_stage_sampler_logged) {
-            if (s_sampler) {
-                D3D11_SAMPLER_DESC sampler_desc;
-                ID3D11SamplerState_GetDesc(s_sampler, &sampler_desc);
-                fprintf(stderr,
-                    "[D3D11-SHADOW-SAMPLER-AB] legacy-final guest-cache=%u/%u host=%u/%u\n",
-                    s_sampler_u, s_sampler_v,
-                    (unsigned)sampler_desc.AddressU, (unsigned)sampler_desc.AddressV);
+    for (st = 0; st < 4; st++)
+        samplers[st] = s_samplers[st];
+    if (shadow_dump_candidate && shadow_per_stage_sampler_test &&
+        !shadow_per_stage_sampler_logged) {
+        for (st = 0; st < 4; st++) {
+            D3D11_SAMPLER_DESC sampler_desc;
+            uint32_t texture_va = tex_stage[st] ? tex_stage[st]->offset : 0u;
+            uint32_t guest_u = tex_stage[st] ? tex_stage[st]->addr_u : 0u;
+            uint32_t guest_v = tex_stage[st] ? tex_stage[st]->addr_v : 0u;
+            uint32_t host_u = 0u, host_v = 0u;
+            if (samplers[st]) {
+                ID3D11SamplerState_GetDesc(samplers[st], &sampler_desc);
+                host_u = (uint32_t)sampler_desc.AddressU;
+                host_v = (uint32_t)sampler_desc.AddressV;
             }
-            for (st = 0; st < 4; st++) {
-                D3D11_SAMPLER_DESC sampler_desc;
-                uint32_t texture_va = tex_stage[st] ? tex_stage[st]->offset : 0u;
-                uint32_t guest_u = tex_stage[st] ? tex_stage[st]->addr_u : 0u;
-                uint32_t guest_v = tex_stage[st] ? tex_stage[st]->addr_v : 0u;
-                uint32_t host_u = 0u, host_v = 0u;
-                if (samplers[st]) {
-                    ID3D11SamplerState_GetDesc(samplers[st], &sampler_desc);
-                    host_u = (uint32_t)sampler_desc.AddressU;
-                    host_v = (uint32_t)sampler_desc.AddressV;
-                }
-                fprintf(stderr,
-                    "[D3D11-SHADOW-SAMPLER-AB] stage=%d tex=0x%08X guest=%u/%u uploaded=%u captured=%u host=%u/%u\n",
-                    st, texture_va, guest_u, guest_v, srvs[st] != NULL,
-                    s_shadow_stage_samplers[st] != NULL, host_u, host_v);
-            }
-            shadow_per_stage_sampler_logged = 1;
+            fprintf(stderr,
+                "[D3D11-SHADOW-SAMPLER-PER-STAGE] stage=%d tex=0x%08X guest=%u/%u uploaded=%u sampler=%u host=%u/%u\n",
+                st, texture_va, guest_u, guest_v, srvs[st] != NULL,
+                samplers[st] != NULL, host_u, host_v);
         }
-    } else {
-        for (st = 0; st < 4; st++)
-            samplers[st] = s_sampler;
+        shadow_per_stage_sampler_logged = 1;
     }
     cb.width = (float)s_width; cb.height = (float)s_height;
     cb.tex_width = textured && tex_stage[0] ? (float)tex_stage[0]->width : 1.0f;
@@ -3273,6 +3814,142 @@ static void d3d11_draw_impl(const Nv2aSurface *surface, const Nv2aBatch *batch)
             actor_no_depth_override_count++;
         }
     }
+    if (sun_only_match && sun_only_trace && sun_only_allowed <= 16u) {
+        const Nv2aTexture *trace_t0 = batch->textures[0] ? batch->textures[0] : batch->texture;
+        const Nv2aTexture *trace_t1 = batch->textures[1];
+        const Nv2aTexture *trace_t2 = batch->textures[2];
+        const Nv2aTexture *trace_t3 = batch->textures[3];
+        D3D11_SAMPLER_DESC trace_sampler_desc;
+        uint32_t trace_host_sampler = 0u;
+        uint32_t trace_i;
+        float trace_u0_min = batch->vertices[0].tex[0][0];
+        float trace_u0_max = trace_u0_min;
+        float trace_v0_min = batch->vertices[0].tex[0][1];
+        float trace_v0_max = trace_v0_min;
+        float trace_z_min = batch->vertices[0].z;
+        float trace_z_max = trace_z_min;
+        float trace_u1_min = batch->vertices[0].tex[1][0];
+        float trace_u1_max = trace_u1_min;
+        float trace_v1_min = batch->vertices[0].tex[1][1];
+        float trace_v1_max = trace_v1_min;
+        ZeroMemory(&trace_sampler_desc, sizeof(trace_sampler_desc));
+        if (samplers[0]) {
+            ID3D11SamplerState_GetDesc(samplers[0], &trace_sampler_desc);
+            trace_host_sampler = 1u;
+        }
+        for (trace_i = 1; trace_i < batch->count; ++trace_i) {
+            const Nv2aVertex *trace_v = &batch->vertices[trace_i];
+            if (trace_v->tex[0][0] < trace_u0_min) trace_u0_min = trace_v->tex[0][0];
+            if (trace_v->tex[0][0] > trace_u0_max) trace_u0_max = trace_v->tex[0][0];
+            if (trace_v->tex[0][1] < trace_v0_min) trace_v0_min = trace_v->tex[0][1];
+            if (trace_v->tex[0][1] > trace_v0_max) trace_v0_max = trace_v->tex[0][1];
+            if (trace_v->z < trace_z_min) trace_z_min = trace_v->z;
+            if (trace_v->z > trace_z_max) trace_z_max = trace_v->z;
+            if (trace_v->tex[1][0] < trace_u1_min) trace_u1_min = trace_v->tex[1][0];
+            if (trace_v->tex[1][0] > trace_u1_max) trace_u1_max = trace_v->tex[1][0];
+            if (trace_v->tex[1][1] < trace_v1_min) trace_v1_min = trace_v->tex[1][1];
+            if (trace_v->tex[1][1] > trace_v1_max) trace_v1_max = trace_v->tex[1][1];
+        }
+        fprintf(stderr,
+            "[D3D11-SUN-TRACE-DETAIL] frame=%u target=0x%08X verts=%u t0=0x%08X/%ux%u/fmt%02X srv0=%u t1=0x%08X/%ux%u/fmt%02X srv1=%u blend=%u src=0x%X dst=0x%X alpha=%u/0x%X/ref%u depth=%u/func0x%X/write%u cull=%u first=(%.3f,%.3f,z=%.6g,rhw=%.6g,uv=%.6g,%.6g)"
+            " comb=0x%08X prog=0x%08X stages=%u texmode=%02X/%02X/%02X/%02X"
+            " uv0=[%.6g..%.6g,%.6g..%.6g] uv1=[%.6g..%.6g,%.6g..%.6g] z=[%.6g..%.6g]"
+            " guest0=%u/%u/%08X guest1=%u/%u/%08X guest2=%u/%u/%08X guest3=%u/%u/%08X"
+            " hostSampler=%u/%u/filter%u valid=%u shared=%u depthrange=[%.6g..%.6g] simple=%u comb_ps=%u"
+            " icw0=%08X/%08X ocw0=%08X/%08X icw1=%08X/%08X ocw1=%08X/%08X"
+            " final=%08X/%08X\n",
+            s_frame_count + 1u, surface->color_va, batch->count,
+            trace_t0 ? trace_t0->offset : 0u, trace_t0 ? trace_t0->width : 0u,
+            trace_t0 ? trace_t0->height : 0u, trace_t0 ? trace_t0->color & 0xFFu : 0u,
+            srvs[0] != NULL, trace_t1 ? trace_t1->offset : 0u,
+            trace_t1 ? trace_t1->width : 0u, trace_t1 ? trace_t1->height : 0u,
+            trace_t1 ? trace_t1->color & 0xFFu : 0u, srvs[1] != NULL,
+            batch->state ? batch->state->blend_enable : 0u,
+            batch->state ? batch->state->blend_src : 0u,
+            batch->state ? batch->state->blend_dst : 0u,
+            batch->state ? batch->state->alpha_test_enable : 0u,
+            batch->state ? batch->state->alpha_func : 0u,
+            batch->state ? batch->state->alpha_ref & 0xFFu : 0u,
+            batch->state ? batch->state->depth_test_enable : 0u,
+            batch->state ? batch->state->depth_func : 0u,
+            batch->state ? batch->state->depth_write : 0u,
+            batch->state ? batch->state->cull_enable : 0u,
+            batch->vertices[0].x, batch->vertices[0].y, batch->vertices[0].z,
+            batch->vertices[0].rhw, batch->vertices[0].tex[0][0], batch->vertices[0].tex[0][1],
+            batch->combiner ? batch->combiner->control : 0u,
+            batch->combiner ? batch->combiner->stage_program : 0u,
+            batch->combiner ? batch->combiner->control & 0xFFu : 0u,
+            batch->combiner ? batch->combiner->stage_program & 0x1Fu : 0u,
+            batch->combiner ? (batch->combiner->stage_program >> 5) & 0x1Fu : 0u,
+            batch->combiner ? (batch->combiner->stage_program >> 10) & 0x1Fu : 0u,
+            batch->combiner ? (batch->combiner->stage_program >> 15) & 0x1Fu : 0u,
+            trace_u0_min, trace_u0_max, trace_v0_min, trace_v0_max,
+            trace_u1_min, trace_u1_max, trace_v1_min, trace_v1_max,
+            trace_z_min, trace_z_max,
+            trace_t0 ? trace_t0->addr_u : 0u,
+            trace_t0 ? trace_t0->addr_v : 0u,
+            trace_t0 ? trace_t0->filter : 0u,
+            trace_t1 ? trace_t1->addr_u : 0u,
+            trace_t1 ? trace_t1->addr_v : 0u,
+            trace_t1 ? trace_t1->filter : 0u,
+            trace_t2 ? trace_t2->addr_u : 0u,
+            trace_t2 ? trace_t2->addr_v : 0u,
+            trace_t2 ? trace_t2->filter : 0u,
+            trace_t3 ? trace_t3->addr_u : 0u,
+            trace_t3 ? trace_t3->addr_v : 0u,
+            trace_t3 ? trace_t3->filter : 0u,
+            (unsigned)trace_sampler_desc.AddressU,
+            (unsigned)trace_sampler_desc.AddressV,
+            (unsigned)trace_sampler_desc.Filter,
+            trace_host_sampler,
+            trace_host_sampler && samplers[0] == samplers[1] &&
+                samplers[0] == samplers[2] && samplers[0] == samplers[3] ? 1u : 0u,
+            batch->state ? batch->state->depth_min : 0.0f,
+            batch->state ? batch->state->depth_max : 1.0f,
+            batch->combiner ? nv2a_rc_is_atv_texture_diffuse(batch->combiner) : 0u,
+            comb_ps != NULL,
+            batch->combiner ? batch->combiner->color_icw[0] : 0u,
+            batch->combiner ? batch->combiner->alpha_icw[0] : 0u,
+            batch->combiner ? batch->combiner->color_ocw[0] : 0u,
+            batch->combiner ? batch->combiner->alpha_ocw[0] : 0u,
+            batch->combiner ? batch->combiner->color_icw[1] : 0u,
+            batch->combiner ? batch->combiner->alpha_icw[1] : 0u,
+            batch->combiner ? batch->combiner->color_ocw[1] : 0u,
+            batch->combiner ? batch->combiner->alpha_ocw[1] : 0u,
+            batch->combiner ? batch->combiner->final0 : 0u,
+            batch->combiner ? batch->combiner->final1 : 0u);
+    }
+    if (sun_only_match && sun_only_force_state && batch->state) {
+        actor_depth_state = *batch->state;
+        actor_depth_state.depth_test_enable = 0;
+        actor_depth_state.depth_write = 0;
+        actor_depth_state.alpha_test_enable = 0;
+        actor_depth_state.cull_enable = 0;
+        render_state = &actor_depth_state;
+        if (sun_only_allowed <= 16u)
+            fprintf(stderr, "[D3D11-SUN-FORCE-STATE] frame=%u target=0x%08X depth=off alpha=off cull=off blend=%u\n",
+                    s_frame_count + 1u, surface->color_va, actor_depth_state.blend_enable);
+    }
+    if ((sun_force_blend_one || sun_force_blend_src_alpha ||
+         sun_force_blend_src_alpha_inv_src_alpha) &&
+        sun_only_match && batch->state) {
+        sun_blend_state = *render_state;
+        sun_blend_state.blend_enable = 1;
+        sun_blend_state.blend_src = (sun_force_blend_src_alpha ||
+            sun_force_blend_src_alpha_inv_src_alpha) ? 0x302 : 0x1;
+        if (sun_force_blend_src_alpha_inv_src_alpha)
+            sun_blend_state.blend_dst = 0x303;
+        render_state = &sun_blend_state;
+        if (sun_force_blend_src_alpha_inv_src_alpha)
+            fprintf(stderr, "[D3D11-SUN-BLEND-SRC-INV-SRC-ALPHA] frame=%u target=0x%08X src=0x%X dst=0x%X\n",
+                    s_frame_count + 1u, surface->color_va, sun_blend_state.blend_src,
+                    sun_blend_state.blend_dst);
+        else
+            fprintf(stderr, sun_force_blend_src_alpha ?
+                    "[D3D11-SUN-BLEND-SRC-ALPHA] frame=%u target=0x%08X src=SRC_ALPHA dst=0x%X\n" :
+                    "[D3D11-SUN-BLEND-ONE] frame=%u target=0x%08X src=ONE dst=0x%X\n",
+                    s_frame_count + 1u, surface->color_va, sun_blend_state.blend_dst);
+    }
     apply_render_state(render_state);
     if (!s_binding_cache_valid || s_bound_vb != s_vb ||
         s_bound_vb_stride != stride || s_bound_vb_offset != offset)
@@ -3315,6 +3992,11 @@ static void d3d11_draw_impl(const Nv2aSurface *surface, const Nv2aBatch *batch)
     }
     s_binding_cache_valid = 1;
     ID3D11DeviceContext_Draw(s_ctx, batch->count, 0);
+    trace_sun_sprite_draw(surface, batch);
+    trace_sun_all_draw(surface, batch);
+    if (sun_rt_capture_enabled)
+        dump_sun_candidate_source_once(surface, batch,
+            batch->textures[0] ? batch->textures[0] : batch->texture, srvs[0]);
     s_vb_cursor += batch->count;
     s_draw_count++;
     if (s_perf_trace) {
@@ -3375,12 +4057,21 @@ static void d3d11_draw_impl(const Nv2aSurface *surface, const Nv2aBatch *batch)
         if (invalid)
             model_like = 1;
         /* Level 3 includes small screen-aligned quads such as shadow cards. */
-        if (model_like || batch_trace_enabled() >= 3) {
+        if (model_like || batch_trace_enabled() >= 3 ||
+            (sun_trace_enabled() && sun_trace_active())) {
             const Nv2aTexture *t1 = batch->textures[1];
             if (sun_trace_enabled() && (diagnostic_f12_down() || sun_trace_active()) &&
                 surface->width == 640 && surface->height == 480 &&
-                t0 && finite && s_sun_trace_samples < 256 &&
-                (max_x - min_x) >= 24.0f && (max_y - min_y) >= 24.0f) {
+                finite && s_sun_trace_samples < 512 &&
+                (max_x - min_x) >= 2.0f && (max_x - min_x) <= 256.0f &&
+                (max_y - min_y) >= 2.0f && (max_y - min_y) <= 256.0f &&
+                (getenv("RECOMP_D3D_SUN_TRACE_ALL") ||
+                 ((max_x >= 450.0f && min_x <= 550.0f &&
+                   max_y >= 45.0f && min_y <= 140.0f &&
+                   max_y >= 10.0f && min_y <= 170.0f)) ||
+                 (getenv("RECOMP_D3D_SUN_TOPCENTER_TRACE") &&
+                  max_x >= 270.0f && min_x <= 340.0f &&
+                  max_y >= 0.0f && min_y <= 35.0f))) {
                 uint32_t k;
                 float u0min = batch->vertices[0].tex[0][0];
                 float u0max = u0min;
@@ -3401,11 +4092,12 @@ static void d3d11_draw_impl(const Nv2aSurface *surface, const Nv2aBatch *batch)
                     if (sv->tex[1][1] < v1min) v1min = sv->tex[1][1];
                     if (sv->tex[1][1] > v1max) v1max = sv->tex[1][1];
                 }
-                fprintf(stderr, "[D3D11-SUN-CANDIDATE] frame=%u draw=%u verts=%u xy=[%.2f..%.2f,%.2f..%.2f] z=[%.5g..%.5g] rhw=[%.5g..%.5g] tex0=0x%08X %ux%u fmt=0x%02X tex1=0x%08X %ux%u fmt1=0x%02X uv0=[%.3f..%.3f,%.3f..%.3f] uv1=[%.3f..%.3f,%.3f..%.3f] blend=%u src=0x%X dst=0x%X alpha=%u/0x%X/%u depth=%u cull=%u comb=0x%08X prog=0x%08X diffuse=%08X\n",
-                        s_frame_count + 1, s_draw_count, batch->count,
+                fprintf(stderr, "[D3D11-SUN-CANDIDATE] target=0x%08X frame=%u draw=%u verts=%u xy=[%.2f..%.2f,%.2f..%.2f] z=[%.5g..%.5g] rhw=[%.5g..%.5g] tex0=%u/0x%08X %ux%u fmt=0x%02X tex1=%u/0x%08X %ux%u fmt1=0x%02X uv0=[%.3f..%.3f,%.3f..%.3f] uv1=[%.3f..%.3f,%.3f..%.3f] blend=%u src=0x%X dst=0x%X alpha=%u/0x%X/%u depth=%u cull=%u comb=0x%08X prog=0x%08X diffuse0=%08X diffuseN=%08X\n",
+                        surface->color_va, s_frame_count + 1, s_draw_count, batch->count,
                         min_x, max_x, min_y, max_y, min_z, max_z, min_w, max_w,
-                        t0->offset, t0->width, t0->height, t0->color & 0xFF,
-                        t1 ? t1->offset : 0, t1 ? t1->width : 0,
+                        t0 != NULL, t0 ? t0->offset : 0, t0 ? t0->width : 0,
+                        t0 ? t0->height : 0, t0 ? t0->color & 0xFF : 0,
+                        t1 != NULL, t1 ? t1->offset : 0, t1 ? t1->width : 0,
                         t1 ? t1->height : 0, t1 ? t1->color & 0xFF : 0,
                         u0min, u0max, v0min, v0max,
                         u1min, u1max, v1min, v1max,
@@ -3419,8 +4111,25 @@ static void d3d11_draw_impl(const Nv2aSurface *surface, const Nv2aBatch *batch)
                         batch->state ? batch->state->cull_enable : 0,
                         batch->combiner ? batch->combiner->control : 0,
                         batch->combiner ? batch->combiner->stage_program : 0,
-                        batch->vertices[0].diffuse);
+                        batch->vertices[0].diffuse,
+                        batch->vertices[batch->count - 1].diffuse);
                 s_sun_trace_samples++;
+                if (((max_x >= 450.0f && min_x <= 550.0f &&
+                      max_y >= 45.0f && min_y <= 140.0f) ||
+                     (getenv("RECOMP_D3D_SUN_TOPCENTER_TRACE") &&
+                      max_x >= 270.0f && min_x <= 340.0f &&
+                      max_y >= 0.0f && min_y <= 35.0f)) &&
+                    batch->count <= 12u) {
+                    for (k = 0; k < batch->count; ++k) {
+                        const Nv2aVertex *pv = &batch->vertices[k];
+                        fprintf(stderr,
+                            "[D3D11-SUN-PATCH-VERTEX] target=0x%08X frame=%u draw=%u v=%u xy=(%.3f,%.3f) z=%.6g rhw=%.6g uv0=(%.6g,%.6g) uv1=(%.6g,%.6g) diffuse=%08X\n",
+                            surface->color_va, s_frame_count + 1u, s_draw_count,
+                            k, pv->x, pv->y, pv->z, pv->rhw,
+                            pv->tex[0][0], pv->tex[0][1],
+                            pv->tex[1][0], pv->tex[1][1], pv->diffuse);
+                    }
+                }
             }
             static int raw_trace_enabled = -1;
             static int raw_trace_dumps;
@@ -3725,6 +4434,35 @@ static void d3d11_flip(void)
         }
         if (s_perf_trace)
             QueryPerformanceCounter(&present_start);
+        if (s_menu_trace_enabled < 0) {
+            const char *menu_trace_env = getenv("RECOMP_D3D_MENU_TRACE");
+            s_menu_trace_enabled = menu_trace_env && menu_trace_env[0] &&
+                                   menu_trace_env[0] != '0';
+        }
+        if (s_menu_trace_enabled && s_menu_trace_frames < 12000u) {
+            const uint32_t traced_frame = s_frame_count + 1u;
+            const char *capture_prefix = getenv("RECOMP_D3D_MENU_CAPTURE_PREFIX");
+            s_menu_trace_frames++;
+            fprintf(stderr,
+                "[D3D11-MENU-FRAME] frame=%u draws=%u callbacks=%u backbuffer_color_clears=%u last_clear_flags=0x%X last_clear_argb=0x%08X\n",
+                traced_frame, s_draw_count, s_frame_callbacks,
+                s_menu_color_clears, s_menu_last_clear_flags,
+                s_menu_last_clear_argb);
+            if (capture_prefix && capture_prefix[0] && s_menu_snapshots < 8u &&
+                diagnostic_f12_down() && (traced_frame % 60u) == 0u) {
+                char capture_path[512];
+                int n = snprintf(capture_path, sizeof(capture_path),
+                                 "%s_%03u.bmp", capture_prefix,
+                                 s_menu_snapshots + 1u);
+                if (n > 0 && (size_t)n < sizeof(capture_path)) {
+                    int saved = dump_backbuffer_bmp(capture_path);
+                    fprintf(stderr,
+                        "[D3D11-MENU-SNAPSHOT] frame=%u saved=%u path=%s\n",
+                        traced_frame, saved != 0, capture_path);
+                    s_menu_snapshots++;
+                }
+            }
+        }
         HRESULT hr = IDXGISwapChain_Present(s_swap_chain, 0, 0);
         if (s_perf_trace) {
             QueryPerformanceCounter(&present_end);
@@ -3751,6 +4489,9 @@ static void d3d11_flip(void)
         invalidate_binding_cache();
         s_frame_count++;
         s_vb_cursor = 0;
+        s_menu_color_clears = 0;
+        s_menu_last_clear_flags = 0;
+        s_menu_last_clear_argb = 0;
         if (s_perf_trace) {
             if (s_draw_count >= 900u) {
                 double draw_ms = (double)s_perf_draw_ticks * 1000.0 /
