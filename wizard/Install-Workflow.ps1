@@ -10,16 +10,34 @@ function Stage([string]$text) { Write-Output "`n[STEP] $text" }
 
 try {
     if (-not (Test-Path -LiteralPath $IsoPath -PathType Leaf)) { throw "Selected XISO file not found: $IsoPath" }
-    $extractor = Join-Path $BundleRoot 'tools\extract-xiso\extract-xiso.exe'
-    if (-not (Test-Path -LiteralPath $extractor -PathType Leaf)) { throw "Bundled XISO extractor is missing: $extractor" }
 
     $workRoot = Join-Path $BundleRoot '.install_work'
-    New-Item -ItemType Directory -Path $workRoot -Force | Out-Null
-    $stageDir = Join-Path $workRoot ('xiso_stage_' + [Guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+    $toolRoot = Join-Path $workRoot 'extract-xiso'
+    $extractor = Join-Path $toolRoot 'extract-xiso.exe'
+    if (-not (Test-Path -LiteralPath $extractor -PathType Leaf)) {
+        Stage 'Downloading the official XboxDev XISO extractor.'
+        New-Item -ItemType Directory -Path $toolRoot -Force | Out-Null
+        $asset = Join-Path $workRoot 'extract-xiso-Win64_Release.zip'
+        $uri = 'https://github.com/XboxDev/extract-xiso/releases/download/build-202609111233/extract-xiso-Win64_Release.zip'
+        $expectedSha256 = 'fc891dfa72f08e3838a2f8b7ec34a8e4d61678da1cc8fee879677f00bf114ce3'
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $uri -OutFile $asset -UseBasicParsing
+        $actualSha256 = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actualSha256 -ne $expectedSha256) { throw "XISO extractor archive SHA-256 mismatch. Expected $expectedSha256; got $actualSha256." }
+        $extractStage = Join-Path $workRoot 'extract-xiso_unpack'
+        if (Test-Path -LiteralPath $extractStage) { Remove-Item -LiteralPath $extractStage -Recurse -Force }
+        Expand-Archive -LiteralPath $asset -DestinationPath $extractStage -Force
+        $downloadedExe = Get-ChildItem -LiteralPath $extractStage -Filter 'extract-xiso.exe' -File -Recurse | Select-Object -First 1
+        if (-not $downloadedExe) { throw 'Official extract-xiso archive did not contain extract-xiso.exe.' }
+        Copy-Item -LiteralPath $downloadedExe.FullName -Destination $extractor -Force
+        Remove-Item -LiteralPath $extractStage -Recurse -Force
+        Write-Output "[INFO] Verified XboxDev release build-202609111233 (SHA-256 $actualSha256). The tool is kept in ignored .install_work/ and is not part of the source package."
+    }
 
     Stage 'Extracting XISO contents to a temporary staging folder.'
     Write-Output "[INFO] Input: $IsoPath"
+    $stageDir = Join-Path $workRoot ('xiso_stage_' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
     & $extractor '-x' '-d' $stageDir $IsoPath
     if ($LASTEXITCODE -ne 0) { throw "extract-xiso failed with exit code $LASTEXITCODE. Ensure the selected image is an Xbox XISO, not a ZIP/7z or full redump ISO." }
 

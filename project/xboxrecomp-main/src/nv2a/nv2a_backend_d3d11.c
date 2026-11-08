@@ -174,6 +174,10 @@ static int s_target_texture_dump_addresses_loaded;
 static uint32_t s_sun_sprite_texture_dump_mask;
 static uint32_t s_sun_sprite_texture_dump_offsets[32];
 static uint32_t s_sun_sprite_texture_dump_count;
+static uint32_t sun_sprite_hash_scan_count;
+static uint32_t sun_sprite_hash_match_count;
+static int sun_sprite_hash_filter_reported;
+static int sun_sprite_hash_summary_reported;
 static int s_sky_texture_trace = -1;
 static int s_shadow_bound_texture_dumped;
 static int s_perf_trace;
@@ -770,8 +774,11 @@ static const char s_hlsl[] =
     "  return outColor;\n"
     "}\n";
 
+static void zq_release_all(void);
+
 static void release_all(void)
 {
+    zq_release_all();
     if (s_ctx) ID3D11DeviceContext_ClearState(s_ctx);
     if (s_blend) ID3D11BlendState_Release(s_blend);
     if (s_rasterizer) ID3D11RasterizerState_Release(s_rasterizer);
@@ -1360,6 +1367,7 @@ static void dump_panel_texture_once(const Nv2aTexture *texture,
     const char *target_prefix = getenv("RECOMP_D3D_TEXTURE_DUMP_PREFIX");
     const char *shadow_prefix = getenv("RECOMP_D3D_SHADOW_TEXTURE_DUMP_PREFIX");
     const char *sun_sprite_prefix = getenv("RECOMP_D3D_SUN_SPRITE_DUMP_PREFIX");
+    const char *sun_sprite_hash_filter = getenv("RECOMP_D3D_SUN_SPRITE_HASH");
     const char *prefix = NULL;
     FILE *file, *alpha_file;
     char path[512], alpha_path[512];
@@ -1411,6 +1419,55 @@ static void dump_panel_texture_once(const Nv2aTexture *texture,
           (texture->width == 128u && texture->height == 128u)) ||
          ((texture->color & 0xFFu) == 0x0Cu &&
           texture->width == 16u && texture->height == 16u))) {
+        if (sun_sprite_hash_filter && *sun_sprite_hash_filter) {
+            char *hash_end = NULL;
+            unsigned long long expected_hash =
+                strtoull(sun_sprite_hash_filter, &hash_end, 16);
+            uint64_t candidate_hash;
+
+            if (hash_end == sun_sprite_hash_filter || !hash_end || *hash_end != '\0') {
+                if (!sun_sprite_hash_filter_reported) {
+                    fprintf(stderr,
+                            "[D3D11-SUN-SPRITE-HASH-FILTER] invalid value='%s'\n",
+                            sun_sprite_hash_filter);
+                    sun_sprite_hash_filter_reported = 1;
+                }
+                return;
+            }
+            if (!sun_sprite_hash_filter_reported) {
+                fprintf(stderr,
+                        "[D3D11-SUN-SPRITE-HASH-FILTER] expected=%016llX\n",
+                        expected_hash);
+                sun_sprite_hash_filter_reported = 1;
+            }
+
+            candidate_hash = decoded_texture_sample_hash(
+                pixels, texture->width, texture->height);
+            ++sun_sprite_hash_scan_count;
+            if (candidate_hash != (uint64_t)expected_hash) {
+                if (sun_sprite_hash_scan_count <= 128u ||
+                    (sun_sprite_hash_scan_count & 127u) == 0u) {
+                    fprintf(stderr,
+                            "[D3D11-SUN-SPRITE-HASH-SCAN] candidates=%u matches=%u last=0x%08X hash=%016llX expected=%016llX\n",
+                            sun_sprite_hash_scan_count,
+                            sun_sprite_hash_match_count,
+                            texture->offset,
+                            (unsigned long long)candidate_hash,
+                            expected_hash);
+                }
+                return;
+            }
+            ++sun_sprite_hash_match_count;
+            if (sun_sprite_hash_match_count <= 32u) {
+                fprintf(stderr,
+                        "[D3D11-SUN-SPRITE-HASH-MATCH] scan=%u match=%u guest=0x%08X size=%ux%u fmt=0x%02X hash=%016llX\n",
+                        sun_sprite_hash_scan_count,
+                        sun_sprite_hash_match_count,
+                        texture->offset, texture->width, texture->height,
+                        texture->color & 0xFFu,
+                        (unsigned long long)candidate_hash);
+            }
+        }
         for (sun_sprite_i = 0; sun_sprite_i < s_sun_sprite_texture_dump_count;
              ++sun_sprite_i) {
             if (s_sun_sprite_texture_dump_offsets[sun_sprite_i] == texture->offset)
@@ -2627,13 +2684,11 @@ static void apply_render_state(const Nv2aRenderState *rs)
         s_bound_depth = s_depth_disabled;
         return;
     }
-    if (rs->color_mask) {
-        mask = 0;
-        if (rs->color_mask & 0x00000001) mask |= D3D11_COLOR_WRITE_ENABLE_BLUE;
-        if (rs->color_mask & 0x00000100) mask |= D3D11_COLOR_WRITE_ENABLE_GREEN;
-        if (rs->color_mask & 0x00010000) mask |= D3D11_COLOR_WRITE_ENABLE_RED;
-        if (rs->color_mask & 0x01000000) mask |= D3D11_COLOR_WRITE_ENABLE_ALPHA;
-    }
+    mask = 0;
+    if (rs->color_mask & 0x00000001) mask |= D3D11_COLOR_WRITE_ENABLE_BLUE;
+    if (rs->color_mask & 0x00000100) mask |= D3D11_COLOR_WRITE_ENABLE_GREEN;
+    if (rs->color_mask & 0x00010000) mask |= D3D11_COLOR_WRITE_ENABLE_RED;
+    if (rs->color_mask & 0x01000000) mask |= D3D11_COLOR_WRITE_ENABLE_ALPHA;
     bkey[0] = rs->blend_enable; bkey[1] = rs->blend_src;
     bkey[2] = rs->blend_dst; bkey[3] = rs->blend_eq; bkey[4] = mask;
     if (!s_blend_key_valid || memcmp(s_blend_key, bkey, sizeof(bkey)) != 0) {
@@ -4596,7 +4651,159 @@ static void d3d11_flip(void)
     }
 }
 
-static const Nv2aBackend s_backend = { d3d11_clear, d3d11_draw, d3d11_flip };
+#define ZQ_POOL       16
+#define ZQ_TIMEOUT_MS 250
+enum { ZQ_FREE = 0, ZQ_COUNTING = 1, ZQ_ENDED = 2 };
+typedef struct { ID3D11Query *q; int state; uint32_t seq; } ZQuery;
+static ZQuery s_zq[ZQ_POOL];
+static int s_zq_counting = -1;
+static uint32_t s_zq_seq;
+static uint64_t s_zq_total;
+static int s_zq_off = -1, s_zq_trace = -1, s_zq_fail_logged;
+static unsigned s_zq_reports, s_zq_timeouts;
+
+static void zq_release_all(void)
+{
+    int i;
+    for (i = 0; i < ZQ_POOL; i++) {
+        if (s_zq[i].q) ID3D11Query_Release(s_zq[i].q);
+        s_zq[i].q = NULL;
+        s_zq[i].state = ZQ_FREE;
+    }
+    s_zq_counting = -1;
+    s_zq_total = 0;
+}
+
+static int zq_usable(void)
+{
+    if (s_zq_off < 0) {
+        const char *off = getenv("RECOMP_D3D_ZQUERY");
+        const char *tr = getenv("RECOMP_D3D_ZQUERY_TRACE");
+        s_zq_off = off && off[0] == '0';
+        s_zq_trace = tr && tr[0] && tr[0] != '0';
+    }
+    return !s_zq_off && s_dev && s_ctx;
+}
+
+static int zq_acquire(void)
+{
+    int i, oldest = -1;
+    D3D11_QUERY_DESC desc;
+    for (i = 0; i < ZQ_POOL; i++)
+        if (s_zq[i].state == ZQ_FREE) break;
+    if (i == ZQ_POOL) {
+        for (i = 0; i < ZQ_POOL; i++)
+            if (s_zq[i].state == ZQ_ENDED &&
+                (oldest < 0 || s_zq[i].seq < s_zq[oldest].seq)) oldest = i;
+        if (oldest < 0) return -1;
+        i = oldest;
+        s_zq[i].state = ZQ_FREE;
+    }
+    if (!s_zq[i].q) {
+        desc.Query = D3D11_QUERY_OCCLUSION;
+        desc.MiscFlags = 0;
+        if (FAILED(ID3D11Device_CreateQuery(s_dev, &desc, &s_zq[i].q))) {
+            s_zq[i].q = NULL;
+            if (!s_zq_fail_logged) {
+                fprintf(stderr, "[D3D11-ZQ] CreateQuery(OCCLUSION) failed; visibility tests report 0\n");
+                s_zq_fail_logged = 1;
+            }
+            return -1;
+        }
+    }
+    return i;
+}
+
+static void zq_begin_new(void)
+{
+    int i = zq_acquire();
+    if (i < 0) return;
+    ID3D11DeviceContext_Begin(s_ctx, (ID3D11Asynchronous *)s_zq[i].q);
+    s_zq[i].state = ZQ_COUNTING;
+    s_zq[i].seq = ++s_zq_seq;
+    s_zq_counting = i;
+}
+
+static void zq_end_counting(void)
+{
+    if (s_zq_counting < 0) return;
+    ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)s_zq[s_zq_counting].q);
+    s_zq[s_zq_counting].state = ZQ_ENDED;
+    s_zq_counting = -1;
+}
+
+static void d3d11_zpass_enable(int enable)
+{
+    if (!zq_usable()) return;
+    if (enable) {
+        if (s_zq_counting < 0) zq_begin_new();
+    } else {
+        zq_end_counting();
+    }
+}
+
+static void d3d11_zpass_clear(void)
+{
+    int i;
+    s_zq_total = 0;
+    if (!zq_usable()) return;
+    for (i = 0; i < ZQ_POOL; i++)
+        if (s_zq[i].state == ZQ_ENDED) s_zq[i].state = ZQ_FREE;
+    if (s_zq_counting >= 0) {
+        ID3D11Asynchronous *a = (ID3D11Asynchronous *)s_zq[s_zq_counting].q;
+        ID3D11DeviceContext_End(s_ctx, a);
+        ID3D11DeviceContext_Begin(s_ctx, a);
+    }
+}
+
+static uint32_t d3d11_zpass_read(void)
+{
+    int i, resume = 0;
+    LARGE_INTEGER t0, t1, fq;
+    if (!zq_usable()) return 0;
+    if (s_zq_counting >= 0) {
+        zq_end_counting();
+        resume = 1;
+    }
+    QueryPerformanceFrequency(&fq);
+    QueryPerformanceCounter(&t0);
+    for (i = 0; i < ZQ_POOL; i++) {
+        UINT64 n = 0;
+        HRESULT hr;
+        if (s_zq[i].state != ZQ_ENDED) continue;
+        for (;;) {
+            hr = ID3D11DeviceContext_GetData(s_ctx,
+                (ID3D11Asynchronous *)s_zq[i].q, &n, sizeof(n), 0);
+            if (hr == S_OK) {
+                s_zq_total += n;
+                s_zq[i].state = ZQ_FREE;
+                break;
+            }
+            if (hr != S_FALSE) {
+                s_zq[i].state = ZQ_FREE;
+                break;
+            }
+            QueryPerformanceCounter(&t1);
+            if ((t1.QuadPart - t0.QuadPart) * 1000 >
+                (LONGLONG)ZQ_TIMEOUT_MS * fq.QuadPart) {
+                s_zq_timeouts++;
+                break;
+            }
+            SwitchToThread();
+        }
+    }
+    if (resume) zq_begin_new();
+    if (s_zq_trace && s_zq_reports < 64u)
+        fprintf(stderr, "[D3D11-ZQ] report #%u samples=%llu timeouts=%u\n",
+                s_zq_reports, (unsigned long long)s_zq_total, s_zq_timeouts);
+    s_zq_reports++;
+    return s_zq_total > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)s_zq_total;
+}
+
+static const Nv2aBackend s_backend = {
+    d3d11_clear, d3d11_draw, d3d11_flip,
+    d3d11_zpass_clear, d3d11_zpass_enable, d3d11_zpass_read
+};
 
 int nv2a_backend_d3d11_init(void)
 {
@@ -4726,6 +4933,15 @@ int nv2a_backend_d3d11_init(void)
 
 void nv2a_backend_d3d11_shutdown(void)
 {
+    const char *sun_sprite_hash_filter = getenv("RECOMP_D3D_SUN_SPRITE_HASH");
+    if (sun_sprite_hash_filter && *sun_sprite_hash_filter &&
+        !sun_sprite_hash_summary_reported) {
+        fprintf(stderr,
+                "[D3D11-SUN-SPRITE-HASH-SUMMARY] expected=%s candidates=%u matches=%u dumped=%u\n",
+                sun_sprite_hash_filter, sun_sprite_hash_scan_count,
+                sun_sprite_hash_match_count, s_sun_sprite_texture_dump_count);
+        sun_sprite_hash_summary_reported = 1;
+    }
     if (s_active) nv2a_backend_register(NULL);
     s_active = 0;
     release_all();

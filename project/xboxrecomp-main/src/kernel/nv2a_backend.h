@@ -103,6 +103,10 @@ typedef struct {
                   uint32_t flags, uint32_t argb, uint32_t zstencil);
     void (*draw)(const Nv2aSurface *s, const Nv2aBatch *b);
     void (*flip)(void);
+    /* Optional D3D-style visibility-test hooks for NV097 Z-pass reports. */
+    void (*zpass_clear)(void);
+    void (*zpass_enable)(int enable);
+    uint32_t (*zpass_read)(void);
 } Nv2aBackend;
 
 /* Register (or, with NULL, remove) the back end. Call before the title starts

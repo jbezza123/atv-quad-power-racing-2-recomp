@@ -4765,14 +4765,21 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x09C4: memcpy(&s_gpu.fog_param[1], &param, 4); break;
     case 0x17C8:                                  /* CLEAR_REPORT_VALUE */
         s_gpu.zpass_count = 0;
+        if (s_backend && s_backend->zpass_clear)
+            s_backend->zpass_clear();
         break;
     case 0x17CC:                                  /* SET_ZPASS_PIXEL_COUNT_ENABLE */
+        if (s_backend && s_backend->zpass_enable &&
+            ((param != 0) != (s_gpu.zpass_enable != 0)))
+            s_backend->zpass_enable(param != 0);
         s_gpu.zpass_enable = param;
         break;
     case 0x17D0: {                                /* GET_REPORT */
+        static int zpass_trace_enabled = -1;
+        static uint32_t zpass_trace_count;
         /* The GPU's answer to a visibility test: 16 bytes at the report
          * DMA offset -- a timestamp, the pixel count, and 0 for "done".
-         * Never written, a title polling it (D3D's GetVisibilityTestResult
+        * Never written, a title polling it (D3D's GetVisibilityTestResult
          * starts the slot at 0xFFFFFFFF) sees every test incomplete. Burnout
          * 3 culls its world with these, so the race's main view drew only
          * the sky while the cube-map passes, which do not test, drew it all.
@@ -4780,8 +4787,23 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
         uint32_t at = dma_resolve(param & 0x00FFFFFFu);
         uint64_t stamp = (uint64_t)s_gpu.reports++ * 1000u;
+        uint32_t count = s_gpu.zpass_count;
+        if (s_backend && s_backend->zpass_read)
+            count += s_backend->zpass_read();
+        if (zpass_trace_enabled < 0) {
+            const char *trace = getenv("RECOMP_D3D_ZPASS_TRACE");
+            zpass_trace_enabled = trace && trace[0] == '1';
+        }
+        if (zpass_trace_enabled && zpass_trace_count < 128u) {
+            fprintf(stderr,
+                    "[D3D11-ZPASS-REPORT] n=%u backend=%d enable=%08X count=%u "
+                    "dma=%08X report=%08X stamp=%llu\n",
+                    zpass_trace_count++, s_backend != NULL, s_gpu.zpass_enable,
+                    count, at, param,
+                    (unsigned long long)stamp);
+        }
         memcpy(mem + at, &stamp, 8);
-        memcpy(mem + at + 8, &s_gpu.zpass_count, 4);
+        memcpy(mem + at + 8, &count, 4);
         memset(mem + at + 12, 0, 4);
         break;
     }

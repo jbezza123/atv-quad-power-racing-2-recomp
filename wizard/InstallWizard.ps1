@@ -74,11 +74,9 @@ function Refresh-Checks {
     $cm = Get-CMakeStatus; $vs = Get-VSStatus
     $lblCmake.Text = $cm.Text; $lblCmake.ForeColor = $(if($cm.Ok){[System.Drawing.Color]::DarkGreen}else{[System.Drawing.Color]::DarkRed})
     $lblVs.Text = $vs.Text; $lblVs.ForeColor = $(if($vs.Ok){[System.Drawing.Color]::DarkGreen}else{[System.Drawing.Color]::DarkRed})
-    $extractor = Join-Path $script:BundleRoot 'tools\extract-xiso\extract-xiso.exe'
-    $extractOk = Test-Path -LiteralPath $extractor
-    $lblXiso.Text = $(if($extractOk){'Bundled XISO extractor: ready'}else{'Bundled XISO extractor: missing'})
-    $lblXiso.ForeColor = $(if($extractOk){[System.Drawing.Color]::DarkGreen}else{[System.Drawing.Color]::DarkRed})
-    $script:PrereqsReady = $cm.Ok -and $vs.Ok -and $extractOk
+    $lblXiso.Text = 'Official XISO extractor downloads and is verified during install'
+    $lblXiso.ForeColor = [System.Drawing.Color]::DarkGreen
+    $script:PrereqsReady = $cm.Ok -and $vs.Ok
     $btnInstallDeps.Enabled = -not ($cm.Ok -and $vs.Ok)
     $btnStart.Enabled = $script:PrereqsReady -and (Test-OptionalFile $txtIso.Text) -and -not $script:ActiveProcess
 }
@@ -149,7 +147,7 @@ $group.Text='Prerequisite check'; $group.Location=New-Object System.Drawing.Poin
 $form.Controls.Add($group)
 $script:lblCmake = New-Label 'CMake: checking...' 14 25 555 22 9 $false
 $script:lblVs = New-Label 'Visual Studio C++ Build Tools: checking...' 14 52 555 22 9 $false
-$script:lblXiso = New-Label 'Bundled XISO extractor: checking...' 14 79 555 22 9 $false
+$script:lblXiso = New-Label 'Official XISO extractor downloads and is verified during install' 14 79 555 22 9 $false
 $group.Controls.AddRange(@($lblCmake,$lblVs,$lblXiso))
 $script:btnRefresh = New-Button 'Refresh checks' 585 24 215 30
 $script:btnInstallDeps = New-Button 'Install missing prerequisites...' 585 64 215 34

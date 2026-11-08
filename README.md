@@ -1,12 +1,12 @@
-﻿# ATV Quad Power Racing 2 - Build & Install Wizard
+# ATV Quad Power Racing 2 - Build & Install Wizard
 
-This is a **source package**, not a game executable distribution. It contains the generated C/CMake project and the matching `xboxrecomp-main` source required to build the current tested Release variant. It does not contain the original game image, XBE, BAH/BAD archives, or other copyrighted game data.
+This is a **source-only package**, not a game executable distribution. No `.exe` files, original game image, XBE, BAH/BAD archives, or other copyrighted game data are included. It contains the generated C/CMake project and matching `xboxrecomp-main` source required to build the Release variant locally.
 
 ## Quick start
 
 1. Extract this package anywhere on a Windows 10/11 x64 PC.
 2. Double-click **Install Wizard.bat**.
-3. The wizard checks CMake 3.20+ and Visual Studio 2022 C++ Build Tools with a Windows SDK before extracting or building anything. If a prerequisite is missing, click **Install missing prerequisites** and approve the official Kitware/Microsoft installers when prompted. Visual Studio may need several GB, an internet connection, and administrator/UAC approval.
+3. The wizard checks CMake 3.20+ and Visual Studio 2022 C++ Build Tools with a Windows SDK before extracting or building anything. It downloads the official XboxDev XISO extractor only when you choose to install, verifies the release archive SHA-256, and stores the tool under ignored `.install_work/`. If a build prerequisite is missing, click **Install missing prerequisites** and approve the official Kitware/Microsoft installers when prompted. Visual Studio may need several GB, an internet connection, and administrator/UAC approval.
 4. If your legally obtained game backup is inside a ZIP/7z, unpack it first until you have the Xbox XISO image. In the wizard, browse to the `.iso`/`.xiso` file and choose **Extract XISO & Build Release**.
 5. The wizard extracts the XISO into the initially empty `game/` folder, checks for `default.xbe`, `ATV.bah`, and `ATV.bad`, then builds the source project in `project/`. It places the newly built `my_xbox_game.exe` at the package root. The first extraction/build is commonly around 12-20 minutes depending on the PC; installing build tools may take longer.
 6. After a successful build, choose whether to create a desktop shortcut. If an `.ico` file has been placed in `icon/`, the shortcut uses it; otherwise it uses the executable icon.
@@ -26,11 +26,11 @@ The scripts in `tools/` can extract indexed stored blocks from the game archives
 
 ## Rights and third-party software
 
-You must provide your own legally obtained copy of ATV Quad Power Racing 2. This project is an independent recompilation effort and is not endorsed by Microsoft or the game publisher. No game data is included here. The bundled XISO utility is XboxDev `extract-xiso` release `build-202609111233`; its license and required acknowledgement are included under `licenses/extract-xiso/` and in `THIRD_PARTY_NOTICES.md`. The `xboxrecomp-main` source includes its own license/notices. Review applicable rights and licenses before redistributing changes.
+You must provide your own legally obtained copy of ATV Quad Power Racing 2. This project is an independent recompilation effort and is not endorsed by Microsoft or the game publisher. No game data is included here. When needed, the installer downloads XboxDev `extract-xiso` release `build-202609111233` from the official release page and verifies its published SHA-256; the license and acknowledgement are included under `licenses/extract-xiso/` and in `THIRD_PARTY_NOTICES.md`. No executable is bundled. The `xboxrecomp-main` source includes its own license/notices. Review applicable rights and licenses before redistributing changes.
 
 ## Generated and local files
 
-The root `.gitignore` excludes the extracted `game/` data, local build output, logs, temporary staging, backups, and the generated game executable. The project source and build wizard remain available to commit or upload; no Git commit or upload is performed by this package.
+The root `.gitignore` excludes executable files, extracted `game/` data, local build output, logs, temporary staging, and backups. The project source and build wizard remain available to commit or upload; no Git commit or upload is performed by this package. When users run the installer, the locally built game executable and temporary XISO utility are ignored and must not be committed.
 
 ## Screenshots
 
